@@ -1,0 +1,32 @@
+{
+  "name": "codex-quota-device",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Provision and control the ESP32-C3 Codex quota display",
+  "bin": {
+    "codex-quota-device": "src/cli.ts"
+  },
+  "scripts": {
+    "codex-quota-device": "node --import tsx src/cli.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm run typecheck && pnpm run test"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@10.28.2",
+  "dependencies": {
+    "cli-progress": "^3.12.0",
+    "open": "11.0.0",
+    "serialport": "13.0.0",
+    "undici": "8.10.0"
+  },
+  "devDependencies": {
+    "@types/cli-progress": "^3.11.6",
+    "@types/node": "22.20.1",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3"
+  }
+}

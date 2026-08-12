@@ -1,0 +1,12 @@
+.pio/
+.pio-core/
+__pycache__/
+*.pyc
+.venv/
+.uv-cache/
+node_modules/
+coverage/
+
+# Device-local configuration and credentials.
+device-config.json
+*.credentials.json
