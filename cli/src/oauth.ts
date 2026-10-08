@@ -10,8 +10,6 @@ export const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const AUTHORIZATION_URL = "https://auth.openai.com/oauth/authorize";
 export const TOKEN_URL = "https://auth.openai.com/oauth/token";
 export const REDIRECT_URI = "http://localhost:1455/auth/callback";
-const CALLBACK_HOST = "localhost";
-const CALLBACK_PORT = 1455;
 const CALLBACK_TIMEOUT_MS = 15 * 60 * 1000;
 
 export interface Tokens {
@@ -58,11 +56,10 @@ export function parseOAuthResponse(status: number, body: string): JsonObject {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
-  } catch (error) {
+  } catch {
     if (status < 200 || status >= 300) return {};
-    throw new OAuthError(`OAuth 服务返回了无法解析的数据（HTTP ${status}）`, {
-      cause: error,
-    });
+    // JSON parse errors can contain fragments of a response carrying credentials.
+    throw new OAuthError(`OAuth 服务返回了无法解析的数据（HTTP ${status}）`);
   }
   if (!isObject(parsed)) {
     throw new OAuthError(`OAuth 服务返回格式异常（HTTP ${status}）`);
@@ -158,18 +155,20 @@ export function createAuthorizationRequest(): AuthorizationRequest {
   };
 }
 
-export function authorizationCodeFromCallback(callbackUrl: string, expectedState: string): string {
+export function authorizationCodeFromCallback(
+  callbackUrl: string, expectedState: string, redirectUri = REDIRECT_URI,
+): string {
   let parsed: URL;
   try {
     parsed = new URL(callbackUrl);
   } catch (error) {
     throw new OAuthError("回调 URL 格式无效", { cause: error });
   }
-  if (parsed.pathname !== "/auth/callback") {
+  const expected = new URL(redirectUri);
+  if (parsed.origin !== expected.origin || parsed.pathname !== expected.pathname) {
     throw new OAuthError("回调 URL 路径无效");
   }
-  const providerError = parsed.searchParams.get("error");
-  if (providerError) throw new OAuthError(`OAuth 授权失败：${providerError}`);
+  if (parsed.searchParams.has("error")) throw new OAuthError("OAuth 授权被拒绝");
   const code = parsed.searchParams.get("code")?.trim();
   if (!code) throw new OAuthError("回调 URL 中没有授权码");
   if (parsed.searchParams.get("state") !== expectedState) {
@@ -192,7 +191,7 @@ function diagnosticValue(name: string, value: unknown): string | number | boolea
   return `[已隐藏，${bytes} B]`;
 }
 
-function responseDiagnostics(
+export function responseDiagnostics(
   response: JsonObject,
   responseBodyBytes: number | undefined,
 ): OAuthResponseDiagnostics {
@@ -266,7 +265,8 @@ interface CallbackListener {
   close: () => Promise<void>;
 }
 
-async function startCallbackListener(expectedState: string): Promise<CallbackListener> {
+async function startCallbackListener(expectedState: string, redirectUri: string): Promise<CallbackListener> {
+  const redirect = new URL(redirectUri);
   let settle: ((code: string) => void) | undefined;
   let fail: ((error: Error) => void) | undefined;
   const wait = new Promise<string>((resolve, reject) => {
@@ -274,17 +274,17 @@ async function startCallbackListener(expectedState: string): Promise<CallbackLis
     fail = reject;
   });
   const server = createServer((request, response) => {
-    const callbackUrl = new URL(request.url ?? "/", REDIRECT_URI).toString();
+    const callbackUrl = new URL(request.url ?? "/", redirectUri).toString();
     try {
-      const code = authorizationCodeFromCallback(callbackUrl, expectedState);
+      const code = authorizationCodeFromCallback(callbackUrl, expectedState, redirectUri);
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      response.end("<p>Codex 登录完成，可以关闭此页面。</p>");
+      response.end("<p>授权已收到，可以关闭此页面并返回 CLI。</p>");
       settle?.(code);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
       response.end(message);
-      fail?.(error instanceof Error ? error : new OAuthError(message));
+      // Ignore unrelated or invalid callbacks; keep waiting for the matching state.
     }
   });
   const timeout = setTimeout(
@@ -294,7 +294,7 @@ async function startCallbackListener(expectedState: string): Promise<CallbackLis
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(CALLBACK_PORT, CALLBACK_HOST, () => {
+      server.listen(Number(redirect.port), redirect.hostname, () => {
         server.off("error", reject);
         resolve();
       });
@@ -302,7 +302,7 @@ async function startCallbackListener(expectedState: string): Promise<CallbackLis
   } catch (error) {
     clearTimeout(timeout);
     const detail = error instanceof Error ? error.message : String(error);
-    throw new OAuthError(`无法监听 localhost:${CALLBACK_PORT} OAuth 回调端口：${detail}`, {
+    throw new OAuthError(`无法监听 ${redirect.host} OAuth 回调端口：${detail}`, {
       cause: error,
     });
   }
@@ -316,7 +316,7 @@ async function startCallbackListener(expectedState: string): Promise<CallbackLis
   };
 }
 
-function waitForPastedCallback(expectedState: string): {
+function waitForPastedCallback(expectedState: string, redirectUri: string): {
   wait: Promise<string>;
   close: () => void;
 } | undefined {
@@ -333,7 +333,7 @@ function waitForPastedCallback(expectedState: string): {
     const input = line.trim();
     if (!input) return;
     try {
-      resolve?.(authorizationCodeFromCallback(input, expectedState));
+      resolve?.(authorizationCodeFromCallback(input, expectedState, redirectUri));
     } catch (error) {
       reject?.(error instanceof Error ? error : new OAuthError(String(error)));
     }
@@ -341,19 +341,30 @@ function waitForPastedCallback(expectedState: string): {
   return { wait, close: () => prompt.close() };
 }
 
+export async function receiveAuthorizationCode(
+  authorization: AuthorizationRequest,
+  redirectUri: string,
+  onAuthorizationUrl: (url: string) => void | Promise<void>,
+): Promise<string> {
+  const listener = await startCallbackListener(authorization.state, redirectUri);
+  const pasted = waitForPastedCallback(authorization.state, redirectUri);
+  // Attach rejection handlers before a browser opener can delay or throw.
+  const result = Promise.race([listener.wait, ...(pasted ? [pasted.wait] : [])]);
+  void result.catch(() => {});
+  try {
+    await onAuthorizationUrl(authorization.authorizationUrl);
+    return await result;
+  } finally {
+    pasted?.close();
+    await listener.close();
+  }
+}
+
 export async function browserLogin(
   onAuthorizationUrl: (url: string) => void | Promise<void>,
   dependencies: BrowserLoginDependencies = {},
 ): Promise<Tokens> {
   const authorization = createAuthorizationRequest();
-  const listener = await startCallbackListener(authorization.state);
-  const pasted = waitForPastedCallback(authorization.state);
-  try {
-    await onAuthorizationUrl(authorization.authorizationUrl);
-    const code = await Promise.race([listener.wait, ...(pasted ? [pasted.wait] : [])]);
-    return await exchangeAuthorizationCode(code, authorization.codeVerifier, dependencies);
-  } finally {
-    pasted?.close();
-    await listener.close();
-  }
+  const code = await receiveAuthorizationCode(authorization, REDIRECT_URI, onAuthorizationUrl);
+  return await exchangeAuthorizationCode(code, authorization.codeVerifier, dependencies);
 }

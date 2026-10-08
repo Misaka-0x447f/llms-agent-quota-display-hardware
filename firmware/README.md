@@ -1,4 +1,4 @@
-# ESP32-C3 Codex 额度屏固件
+# ESP32-C3 Claude 额度屏固件
 
 ## 直插映射
 
@@ -27,8 +27,17 @@ PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -t upload \
   --upload-port /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_*-if00
 ```
 
-串口为 115200 baud。固件使用 NVS 明文保存 Wi-Fi、access token、refresh token
-和 account ID；当前阶段没有启用 ESP32 Flash Encryption。
+串口为 115200 baud。固件使用 NVS 明文保存 Wi-Fi 和 Claude 凭据；当前阶段
+没有启用 ESP32 Flash Encryption。旧 Codex、DeepSeek 和 OpenRouter 配置保留，
+但不再采集或显示。Claude 凭据存入独立的 `claude_auth` NVS 值，不复用旧令牌。
+
+烧录后在电脑运行 `pnpm --dir cli codex-quota-device login` 单独授权 Claude。
+电脑退出后，ESP32 自己请求用量及续期。屏幕第一行显示 5 小时窗口，第二行显示
+7 天窗口，第三行显示更新时间和状态。首次授权与设备续期都成功后，才算验证了
+独立运行能力。`login` 成功仅确认串口写入，不确认上游接口可用。
+
+NVS 在续期前记录进行中状态，成功后一次写入新令牌对及过期时间；如果重启时
+仍处于进行中状态，设备要求重新登录，避免重复使用可能已经被消费的刷新令牌。
 
 HTTPS 使用 `data/cert/x509_crt_bundle.bin` 中嵌入的根证书集合校验服务端证书，
 没有使用 `setInsecure()`。

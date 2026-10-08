@@ -5,37 +5,38 @@ import { parseArgs } from "node:util";
 import open from "open";
 
 import { AbortError, CliError, DeviceError, OAuthError } from "./errors.js";
+import { claudeBrowserLogin } from "./claude-oauth.js";
 import { browserLogin } from "./oauth.js";
 import { readHidden } from "./prompt.js";
 import { requestDevice, resolvePort } from "./serial-link.js";
 
-type Command = "set" | "login" | "list" | "fetchNow" | "erase";
+type Command = "update" | "login" | "list" | "fetchNow" | "erase";
 
-const HELP = `ESP32-C3 Codex 额度屏配置工具
+const HELP = `ESP32-C3 Claude 额度屏配置工具（5 小时 / 7 天）
 
 用法：
-  codex-quota-device set      --ssid SSID [选项]
-  codex-quota-device login    [选项]
+  codex-quota-device update    [选项]
+  codex-quota-device login     [选项]
   codex-quota-device list
   codex-quota-device fetchNow
   codex-quota-device erase
 
-set 选项：
-  --port PORT          手动指定串口；默认自动发现 Espressif 设备
-  --password PASSWORD   省略时安全交互输入
-  --interval MIN        刷新间隔 1～1440 分钟，默认 5
-  --utc-offset +HH:MM   默认使用电脑当前时区
+update 选项（至少指定一个；未指定的参数保持设备原值不变）：
+  --ssid SSID           更新 Wi-Fi 名称（改 SSID 而未给 --password 时会交互提示密码）
+  --password PASSWORD   更新 Wi-Fi 密码
+  --deepseek-key KEY    保留旧 DeepSeek 配置（本版本不采集或显示；两个 key 成对更新）
+  --openrouter-key KEY  保留旧 OpenRouter 配置（本版本不采集或显示）
+  --interval MIN        更新刷新间隔 1～1440 分钟
+  --utc-offset +HH:MM   更新时区偏移
+  --port PORT           手动指定串口；默认自动发现 Espressif 设备
 
 login 选项：
+  --provider NAME       claude（默认）；codex 仅保留旧凭据配置，屏幕只显示 Claude
   --port PORT          手动指定串口；默认自动发现 Espressif 设备
   --no-browser          不自动打开浏览器
 
 list / fetchNow / erase 也接受可选的 --port PORT。
 `;
-
-function defaultUtcOffsetMinutes(): number {
-  return -new Date().getTimezoneOffset();
-}
 
 export function parseUtcOffset(value: string): number {
   const match = /^([+-]?)(\d{1,2}):(\d{2})$/.exec(value);
@@ -50,18 +51,9 @@ export function parseUtcOffset(value: string): number {
   return result;
 }
 
-function formatUtcOffset(minutes: number): string {
-  const sign = minutes < 0 ? "-" : "+";
-  const absolute = Math.abs(minutes);
-  return `${sign}${String(Math.floor(absolute / 60)).padStart(2, "0")}:${String(
-    absolute % 60,
-  ).padStart(2, "0")}`;
-}
-
-function parseInterval(value: string | undefined): number {
-  const text = value ?? "5";
-  if (!/^\d+$/.test(text)) throw new CliError("刷新间隔必须是整数分钟");
-  const interval = Number(text);
+function parseInterval(value: string): number {
+  if (!/^\d+$/.test(value)) throw new CliError("刷新间隔必须是整数分钟");
+  const interval = Number(value);
   if (interval < 1 || interval > 1440) {
     throw new CliError("刷新间隔必须在 1～1440 分钟之间");
   }
@@ -79,6 +71,7 @@ function redactSensitiveText(text: string): string {
       /((?:access_token|refresh_token|id_token|wifi_password|code_verifier|code)=)[^\s&"']+/gi,
       "$1[已隐藏]",
     )
+    .replace(/sk-ant-[A-Za-z0-9_-]+/g, "[Claude 凭据已隐藏]")
     .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[JWT 已隐藏]");
 }
 
@@ -97,7 +90,7 @@ function printError(error: unknown): void {
   if (details.length > 0) console.error(`详细错误：\n${details.join("\n由以下原因引起：\n")}`);
 }
 
-async function setDevice(args: string[]): Promise<void> {
+async function updateDevice(args: string[]): Promise<void> {
   const { values } = parseArgs({
     args,
     strict: true,
@@ -106,32 +99,60 @@ async function setDevice(args: string[]): Promise<void> {
       port: { type: "string" },
       ssid: { type: "string" },
       password: { type: "string" },
-      interval: { type: "string", default: "5" },
-      "utc-offset": {
-        type: "string",
-        default: formatUtcOffset(defaultUtcOffsetMinutes()),
-      },
+      "deepseek-key": { type: "string" },
+      "openrouter-key": { type: "string" },
+      interval: { type: "string" },
+      "utc-offset": { type: "string" },
     },
   });
   const port = await resolvePort(values.port);
-  const ssid = requireString(values.ssid, "--ssid");
-  const interval = parseInterval(values.interval);
-  const utcOffset = parseUtcOffset(values["utc-offset"]);
-  const password = values.password ?? (await readHidden("Wi-Fi 密码："));
+
+  const payload: Record<string, unknown> = { cmd: "configure" };
+
+  // Wi-Fi：给了 --ssid 或 --password 才更新；改 SSID 而未给密码时交互补齐。
+  if (values.ssid !== undefined || values.password !== undefined) {
+    if (values.ssid !== undefined) {
+      payload.wifi_ssid = requireString(values.ssid, "--ssid");
+    }
+    payload.wifi_password =
+      values.password !== undefined
+        ? values.password
+        : await readHidden("Wi-Fi 密码：", "--password");
+  }
+
+  if (values.interval !== undefined) {
+    payload.refresh_minutes = parseInterval(values.interval);
+  }
+
+  if (values["utc-offset"] !== undefined) {
+    payload.utc_offset_minutes = parseUtcOffset(values["utc-offset"]);
+  }
+
+  // 两个 key 成对更新：只给一个时交互补齐另一个。
+  if (values["deepseek-key"] !== undefined || values["openrouter-key"] !== undefined) {
+    const deepseekKey = (
+      values["deepseek-key"] ?? (await readHidden("DeepSeek API Key：", "--deepseek-key"))
+    ).trim();
+    const openrouterKey = (
+      values["openrouter-key"] ?? (await readHidden("OpenRouter API Key：", "--openrouter-key"))
+    ).trim();
+    if (!deepseekKey || !openrouterKey) {
+      throw new CliError("DeepSeek 和 OpenRouter 的 API Key 不能为空");
+    }
+    payload.deepseek_key = deepseekKey;
+    payload.openrouter_key = openrouterKey;
+  }
+
+  const updatedFields = Object.keys(payload).filter((key) => key !== "cmd");
+  if (updatedFields.length === 0) {
+    throw new CliError(
+      "请至少指定一个要更新的参数：--ssid / --password / --deepseek-key / --openrouter-key / --interval / --utc-offset",
+    );
+  }
 
   console.log("正在写入设备配置（不会触发 OAuth）……");
-  const response = await requestDevice(
-    port,
-    {
-      cmd: "configure",
-      wifi_ssid: ssid,
-      wifi_password: password,
-      refresh_minutes: interval,
-      utc_offset_minutes: utcOffset,
-    },
-    20_000,
-  );
-  console.log(`配置完成：刷新间隔 ${String(response.refresh_minutes ?? interval)} 分钟`);
+  await requestDevice(port, payload, 20_000);
+  console.log(`更新完成（${updatedFields.join("、")}）`);
 }
 
 async function loginDevice(args: string[]): Promise<void> {
@@ -142,10 +163,22 @@ async function loginDevice(args: string[]): Promise<void> {
     options: {
       port: { type: "string" },
       "no-browser": { type: "boolean", default: false },
+      provider: { type: "string", default: "claude" },
     },
   });
   const port = await resolvePort(values.port);
-  const tokens = await browserLogin(async (url) => {
+  if (values.provider !== "claude" && values.provider !== "codex") {
+    throw new CliError("--provider 只接受 claude 或 codex");
+  }
+  const isClaude = values.provider === "claude";
+  if (isClaude) {
+    const status = await requestDevice(port, { cmd: "status" }, 20_000);
+    if (status.usage_provider !== "claude") {
+      throw new DeviceError("请先烧录支持 Claude 的固件，再运行 login");
+    }
+  }
+  const login = isClaude ? claudeBrowserLogin : browserLogin;
+  const tokens = await login(async (url) => {
     console.log(`正在打开 OAuth 授权页：${url}`);
     if (!values["no-browser"]) {
       try {
@@ -158,10 +191,10 @@ async function loginDevice(args: string[]): Promise<void> {
     console.log("等待浏览器登录完成并回调 CLI……");
   });
   const loginPayload = {
-    cmd: "login",
+    cmd: isClaude ? "claude_login" : "login",
     access_token: tokens.accessToken,
     refresh_token: tokens.refreshToken,
-    account_id: tokens.accountId,
+    ...(isClaude ? {} : { account_id: tokens.accountId }),
     expires_at: tokens.expiresAt,
   };
   const redactedAuthenticationBody = Object.fromEntries(
@@ -191,10 +224,10 @@ async function loginDevice(args: string[]): Promise<void> {
     loginPayload,
     20_000,
   );
-  console.log(`登录凭据已写入设备：${String(response.account_id ?? "已更新")}`);
+  console.log(`${isClaude ? "Claude" : "Codex"} 登录凭据已写入设备：${String(response.account_id ?? "已更新")}`);
 }
 
-async function simpleCommand(command: Exclude<Command, "set" | "login">, args: string[]) {
+async function simpleCommand(command: Exclude<Command, "update" | "login">, args: string[]) {
   const { values } = parseArgs({
     args,
     strict: true,
@@ -216,11 +249,11 @@ export async function run(argv = process.argv.slice(2)): Promise<void> {
     console.log(HELP);
     return;
   }
-  if (!["set", "login", "list", "fetchNow", "erase"].includes(rawCommand)) {
+  if (!["update", "login", "list", "fetchNow", "erase"].includes(rawCommand)) {
     throw new CliError(`未知命令：${rawCommand}\n\n${HELP}`);
   }
   const command = rawCommand as Command;
-  if (command === "set") await setDevice(args);
+  if (command === "update") await updateDevice(args);
   else if (command === "login") await loginDevice(args);
   else await simpleCommand(command, args);
 }

@@ -1,8 +1,8 @@
 import { AbortError, CliError } from "./errors.js";
 
-export async function readHidden(prompt: string): Promise<string> {
+export async function readHidden(prompt: string, optionHint = "--password"): Promise<string> {
   if (!process.stdin.isTTY || !process.stdout.isTTY || !process.stdin.setRawMode) {
-    throw new CliError("当前终端不支持隐藏输入；请使用 --password 显式传入密码");
+    throw new CliError(`当前终端不支持隐藏输入；请使用 ${optionHint} 显式传入`);
   }
 
   process.stdout.write(prompt);

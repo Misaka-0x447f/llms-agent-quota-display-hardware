@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "ui_glyphs.h"
+#include "claude_protocol.h"
 
 namespace pins {
 constexpr uint8_t kI2cClock = 9;
@@ -23,17 +24,28 @@ constexpr uint32_t kSerialBaud = 115200;
 constexpr uint32_t kI2cFrequency = 100000;
 constexpr uint32_t kDebounceMs = 25;
 constexpr uint32_t kIdleRedrawMs = 60000;
-constexpr uint32_t kFiveHourSeconds = 5UL * 60 * 60;
-constexpr uint32_t kSevenDaySeconds = 7UL * 24 * 60 * 60;
 constexpr uint32_t kMinimumValidEpoch = 1700000000UL;
 constexpr uint16_t kMinimumRefreshMinutes = 1;
 constexpr uint16_t kMaximumRefreshMinutes = 1440;
-constexpr uint32_t kInitialRetryDelaySeconds = 4;
-constexpr uint32_t kMaximumRetryDelaySeconds = 60;
+constexpr uint32_t kInitialRetryDelaySeconds = 30;
+constexpr uint32_t kMaximumRetryDelaySeconds = 15 * 60;
 constexpr size_t kMaximumSerialCommandBytes = 64 * 1024;
-constexpr char kClientId[] = "app_EMoamEEZ73f0CkXaXp7hrann";
-constexpr char kTokenUrl[] = "https://auth.openai.com/oauth/token";
-constexpr char kUsageUrl[] = "https://chatgpt.com/backend-api/wham/usage";
+constexpr char kClaudeClientId[] = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+constexpr char kClaudeTokenUrl[] = "https://platform.claude.com/v1/oauth/token";
+constexpr char kClaudeUsageUrl[] = "https://api.anthropic.com/api/oauth/usage";
+
+struct ClaudeAuth {
+  String provisionId;
+  String accessToken;
+  String refreshToken;
+  uint64_t expiresAt = 0;
+  // Persist before sending a rotating refresh token. An interrupted exchange must
+  // not be replayed on restart: the server may already have consumed the token.
+  bool pending = false;
+  bool configured() const { return !accessToken.isEmpty() && !refreshToken.isEmpty(); }
+};
+ClaudeAuth claudeAuth;
+uint32_t claudeBlockedUntil = 0;
 
 extern const uint8_t rootca_crt_bundle_start[]
     asm("_binary_data_cert_x509_crt_bundle_bin_start");
@@ -72,13 +84,24 @@ struct Settings {
   String accessToken;
   String refreshToken;
   String accountId;
+  String deepseekKey;
+  String openrouterKey;
   uint64_t expiresAt = 0;
   uint16_t refreshMinutes = 5;
   int16_t utcOffsetMinutes = 0;
 
+  bool codexConfigured() const {
+    return !accessToken.isEmpty() && !refreshToken.isEmpty() && !accountId.isEmpty();
+  }
+
+  bool deepseekConfigured() const { return !deepseekKey.isEmpty(); }
+
+  bool openrouterConfigured() const { return !openrouterKey.isEmpty(); }
+
+  // 本版本只采集和显示 Claude；保留旧配置但不再轮询旧数据源。
   bool credentialsPresent() const {
-    return !wifiSsid.isEmpty() && !accessToken.isEmpty() &&
-           !refreshToken.isEmpty() && !accountId.isEmpty();
+    return !wifiSsid.isEmpty() &&
+           claudeAuth.configured();
   }
 
   bool refreshIntervalValid() const {
@@ -95,12 +118,7 @@ struct Settings {
   }
 };
 
-struct RateWindow {
-  bool present = false;
-  float usedPercent = 0;
-  uint32_t resetAt = 0;
-  uint32_t durationSeconds = 0;
-};
+using RateWindow = claude::RateWindow;
 
 struct Key {
   const char* name;
@@ -122,6 +140,9 @@ Key keys[] = {
     {"K1(UP)", pins::kKeyUp, false, false, 0},
 };
 String serialLine;
+String lastMutationId;
+String lastMutationCommand;
+String lastMutationReply;
 uint32_t lastRefreshEpoch = 0;
 uint32_t nextRefreshAtMs = 0;
 uint32_t nextRedrawAtMs = 0;
@@ -169,7 +190,13 @@ void setError(UiState state, const String& detail) {
 }
 
 void scheduleRetry() {
-  nextRefreshAtMs = millis() + retryDelaySeconds * 1000UL;
+  if (claudeAuth.pending) { nextRefreshAtMs = 0; return; }
+  uint32_t wait = retryDelaySeconds;
+  const uint32_t now = epochNow();
+  if (claudeBlockedUntil > now) wait = max(wait, claudeBlockedUntil - now);
+  // millis deadlines must remain within the signed 32-bit comparison range.
+  wait = min(wait, static_cast<uint32_t>(7 * 86400));
+  nextRefreshAtMs = millis() + wait * 1000UL;
   retryDelaySeconds = min(kMaximumRetryDelaySeconds, retryDelaySeconds * 2);
 }
 
@@ -220,13 +247,53 @@ UiState classifyHttpStatus(int status) {
   return UiState::kHttpError;
 }
 
+bool jsonString(cJSON* object, const char* key, String& destination);
+
+bool saveClaudeAuth(const ClaudeAuth& auth) {
+  cJSON* root = cJSON_CreateObject();
+  if (!root) return false;
+  bool complete = cJSON_AddStringToObject(root, "provision_id", auth.provisionId.c_str()) &&
+      cJSON_AddStringToObject(root, "access_token", auth.accessToken.c_str()) &&
+      cJSON_AddStringToObject(root, "refresh_token", auth.refreshToken.c_str()) &&
+      cJSON_AddNumberToObject(root, "expires_at", static_cast<double>(auth.expiresAt)) &&
+      cJSON_AddBoolToObject(root, "pending", auth.pending);
+  char* encoded = complete ? cJSON_PrintUnformatted(root) : nullptr;
+  // One NVS value commits the token pair and expiry together; never mix generations.
+  bool ok = encoded && preferences.putString("claude_auth", encoded) == strlen(encoded);
+  if (encoded) cJSON_free(encoded);
+  cJSON_Delete(root);
+  return ok;
+}
+
+void loadClaudeAuth() {
+  const String encoded = preferences.getString("claude_auth");
+  cJSON* root = cJSON_Parse(encoded.c_str());
+  if (root) {
+    ClaudeAuth candidate;
+    cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
+    if (jsonString(root, "access_token", candidate.accessToken) &&
+        jsonString(root, "refresh_token", candidate.refreshToken) &&
+        claude::integer(expires, kMinimumValidEpoch, UINT32_MAX) && candidate.configured()) {
+      candidate.expiresAt = static_cast<uint64_t>(expires->valuedouble);
+      jsonString(root, "provision_id", candidate.provisionId);
+      candidate.pending = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "pending"));
+      claudeAuth = candidate;
+    }
+    cJSON_Delete(root);
+  }
+  claudeBlockedUntil = preferences.getUInt("claude_wait", 0);
+}
+
 void loadSettings() {
   preferences.begin("codexquota", false);
+  loadClaudeAuth();
   settings.wifiSsid = preferences.getString("wifi_ssid");
   settings.wifiPassword = preferences.getString("wifi_pass");
   settings.accessToken = preferences.getString("access");
   settings.refreshToken = preferences.getString("refresh");
   settings.accountId = preferences.getString("account");
+  settings.deepseekKey = preferences.getString("deepseek");
+  settings.openrouterKey = preferences.getString("openrouter");
   settings.expiresAt = preferences.getULong64("expires", 0);
   settings.refreshMinutes = preferences.getUShort("period", 5);
   settings.utcOffsetMinutes = preferences.getShort("utc_off", 0);
@@ -243,9 +310,20 @@ bool saveSettings() {
     preferences.remove("wifi_ssid");
   }
   preferences.putString("wifi_pass", settings.wifiPassword);
-  ok &= preferences.putString("access", settings.accessToken) > 0;
-  ok &= preferences.putString("refresh", settings.refreshToken) > 0;
-  ok &= preferences.putString("account", settings.accountId) > 0;
+  // Claude-only devices legitimately have no legacy Codex credentials.
+  if (!settings.accessToken.isEmpty()) ok &= preferences.putString("access", settings.accessToken) > 0;
+  if (!settings.refreshToken.isEmpty()) ok &= preferences.putString("refresh", settings.refreshToken) > 0;
+  if (!settings.accountId.isEmpty()) ok &= preferences.putString("account", settings.accountId) > 0;
+  if (!settings.deepseekKey.isEmpty()) {
+    ok &= preferences.putString("deepseek", settings.deepseekKey) > 0;
+  } else {
+    preferences.remove("deepseek");
+  }
+  if (!settings.openrouterKey.isEmpty()) {
+    ok &= preferences.putString("openrouter", settings.openrouterKey) > 0;
+  } else {
+    preferences.remove("openrouter");
+  }
   ok &= preferences.putULong64("expires", settings.expiresAt) > 0;
   ok &= preferences.putUShort("period", settings.refreshMinutes) > 0;
   ok &= preferences.putShort("utc_off", settings.utcOffsetMinutes) > 0;
@@ -255,6 +333,8 @@ bool saveSettings() {
 void clearSettings() {
   preferences.clear();
   settings = Settings{};
+  claudeAuth = ClaudeAuth{};
+  claudeBlockedUntil = 0;
   fiveHour = RateWindow{};
   sevenDay = RateWindow{};
   lastRefreshEpoch = 0;
@@ -285,28 +365,30 @@ String formEncode(const String& input) {
 }
 
 bool connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return true;
-  uiState = UiState::kConnecting;
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str());
-  const uint32_t deadline = millis() + 15000;
-  while (WiFi.status() != WL_CONNECTED &&
-         static_cast<int32_t>(millis() - deadline) < 0) {
-    delay(100);
-  }
   if (WiFi.status() != WL_CONNECTED) {
-    const wl_status_t status = WiFi.status();
-    const UiState state = status == WL_NO_SSID_AVAIL
-                              ? UiState::kWifiNoNetwork
-                              : status == WL_CONNECT_FAILED
-                                    ? UiState::kWifiConnectionFailed
-                                    : status == WL_CONNECTION_LOST
-                                          ? UiState::kWifiDisconnected
-                                          : UiState::kWifiTimeout;
-    setError(state, wifiStatusDetail(status));
-    return false;
+    uiState = UiState::kConnecting;
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str());
+    const uint32_t deadline = millis() + 15000;
+    while (WiFi.status() != WL_CONNECTED &&
+           static_cast<int32_t>(millis() - deadline) < 0) {
+      delay(100);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      const wl_status_t status = WiFi.status();
+      const UiState state = status == WL_NO_SSID_AVAIL
+                                ? UiState::kWifiNoNetwork
+                                : status == WL_CONNECT_FAILED
+                                      ? UiState::kWifiConnectionFailed
+                                      : status == WL_CONNECTION_LOST
+                                            ? UiState::kWifiDisconnected
+                                            : UiState::kWifiTimeout;
+      setError(state, wifiStatusDetail(status));
+      return false;
+    }
   }
+  if (epochNow() != 0) return true;
   configTime(0, 0, "pool.ntp.org", "time.cloudflare.com", "time.google.com");
   const uint32_t timeDeadline = millis() + 10000;
   while (epochNow() == 0 && static_cast<int32_t>(millis() - timeDeadline) < 0) {
@@ -326,154 +408,146 @@ bool jsonString(cJSON* object, const char* key, String& destination) {
   return true;
 }
 
-bool refreshAccessToken() {
-  if (!connectWiFi()) return false;
-  if (!resolveHost("auth.openai.com")) return false;
+void recordClaudeCooldown(HTTPClient& http, int status) {
+  const String retryAfter = http.header("Retry-After");
+  const uint32_t requested = claude::retryAfter(retryAfter.c_str(), epochNow());
+  if (status != 429 && requested == 0) return;
+  uint32_t delay = max(requested, static_cast<uint32_t>(status == 429 ? 300 : 30));
+  const uint64_t until = static_cast<uint64_t>(epochNow()) + delay;
+  claudeBlockedUntil = until > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(until);
+  preferences.putUInt("claude_wait", claudeBlockedUntil);
+}
+
+bool refreshClaudeToken() {
+  if (claudeAuth.pending) {
+    setError(UiState::kAuthError, "Claude 续期结果不确定或凭据失效，请重新运行 login");
+    return false;
+  }
+  if (!resolveHost("platform.claude.com")) return false;
   WiFiClientSecure client;
   client.setCACertBundle(rootca_crt_bundle_start);
   HTTPClient http;
   http.setConnectTimeout(10000);
-  http.setTimeout(15000);
-  if (!http.begin(client, kTokenUrl)) {
-    setError(UiState::kTransportError, "OAuth 请求初始化失败");
+  http.setTimeout(30000);
+  if (!http.begin(client, kClaudeTokenUrl)) {
+    setError(UiState::kTransportError, "Claude OAuth 请求初始化失败");
     return false;
   }
+  const char* headers[] = {"Retry-After"};
+  http.collectHeaders(headers, 1);
   http.addHeader("Accept", "application/json");
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  String body = "client_id=" + formEncode(kClientId) +
-                "&grant_type=refresh_token&refresh_token=" +
-                formEncode(settings.refreshToken) +
-                "&scope=openid%20profile%20email";
+  const String body = "grant_type=refresh_token&client_id=" + formEncode(kClaudeClientId) +
+                      "&refresh_token=" + formEncode(claudeAuth.refreshToken);
+  ClaudeAuth pending = claudeAuth;
+  pending.pending = true;
+  if (!saveClaudeAuth(pending)) {
+    http.end();
+    setError(UiState::kConfigError, "无法保存 Claude 续期状态，未发送请求");
+    return false;
+  }
+  claudeAuth = pending;
   const int status = http.POST(body);
-  const String response = http.getString();
+  const String response = status == 200 ? http.getString() : String();
+  recordClaudeCooldown(http, status);
   http.end();
   if (status <= 0) {
-    setError(transportState(status, client), transportDetail("OAuth", status, client));
+    setError(UiState::kAuthError, "Claude OAuth 续期响应丢失，请重新运行 login");
     return false;
   }
   if (status != 200) {
-    setError(status == 400 ? UiState::kAuthError : classifyHttpStatus(status),
-             "OAuth 服务返回 HTTP " + String(status));
-    return false;
-  }
-
-  cJSON* root = cJSON_ParseWithLength(response.c_str(), response.length());
-  if (root == nullptr) {
-    setError(UiState::kDataError, "OAuth 响应不是有效 JSON");
-    return false;
-  }
-  String accessToken;
-  String rotatedRefreshToken;
-  cJSON* expiresIn = cJSON_GetObjectItemCaseSensitive(root, "expires_in");
-  bool valid = jsonString(root, "access_token", accessToken) &&
-               cJSON_IsNumber(expiresIn) && expiresIn->valuedouble > 0;
-  jsonString(root, "refresh_token", rotatedRefreshToken);
-  if (valid) {
-    settings.accessToken = accessToken;
-    if (!rotatedRefreshToken.isEmpty()) settings.refreshToken = rotatedRefreshToken;
-    settings.expiresAt = static_cast<uint64_t>(epochNow()) +
-                         static_cast<uint64_t>(expiresIn->valuedouble);
-    if (!saveSettings()) valid = false;
-  }
-  cJSON_Delete(root);
-  if (!valid) setError(UiState::kDataError, "OAuth 响应缺少 access_token 或 expires_in");
-  return valid;
-}
-
-bool parseRateWindow(cJSON* value, RateWindow& output) {
-  if (!cJSON_IsObject(value)) return false;
-  cJSON* used = cJSON_GetObjectItemCaseSensitive(value, "used_percent");
-  cJSON* resetAt = cJSON_GetObjectItemCaseSensitive(value, "reset_at");
-  cJSON* duration = cJSON_GetObjectItemCaseSensitive(value, "limit_window_seconds");
-  if (!cJSON_IsNumber(used) || !cJSON_IsNumber(duration)) return false;
-  output.present = true;
-  output.usedPercent = constrain(static_cast<float>(used->valuedouble), 0.0f, 100.0f);
-  output.durationSeconds = static_cast<uint32_t>(duration->valuedouble);
-  output.resetAt = cJSON_IsNumber(resetAt)
-                       ? static_cast<uint32_t>(resetAt->valuedouble)
-                       : 0;
-  return true;
-}
-
-bool parseUsage(const String& response) {
-  cJSON* root = cJSON_ParseWithLength(response.c_str(), response.length());
-  if (root == nullptr) return false;
-  cJSON* rateLimit = cJSON_GetObjectItemCaseSensitive(root, "rate_limit");
-  RateWindow parsedFive;
-  RateWindow parsedSeven;
-  if (cJSON_IsObject(rateLimit)) {
-    const char* names[] = {"primary_window", "secondary_window"};
-    for (const char* name : names) {
-      RateWindow candidate;
-      if (!parseRateWindow(cJSON_GetObjectItemCaseSensitive(rateLimit, name), candidate)) {
-        continue;
-      }
-      if (candidate.durationSeconds == kFiveHourSeconds) parsedFive = candidate;
-      if (candidate.durationSeconds == kSevenDaySeconds) parsedSeven = candidate;
+    // Only explicit retryable rejections permit reusing this refresh token.
+    if (status == 429 || status >= 500) {
+      pending.pending = false;
+      if (saveClaudeAuth(pending)) claudeAuth = pending;
     }
+    setError(claudeAuth.pending ? UiState::kAuthError : classifyHttpStatus(status),
+             "Claude OAuth 服务返回 HTTP " + String(status));
+    return false;
   }
+  cJSON* root = cJSON_ParseWithOpts(response.c_str(), nullptr, true);
+  ClaudeAuth candidate;
+  candidate.provisionId = claudeAuth.provisionId;
+  cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires_in");
+  bool valid = jsonString(root, "access_token", candidate.accessToken) &&
+      jsonString(root, "refresh_token", candidate.refreshToken) && candidate.configured() &&
+      claude::integer(expires, 1, 365 * 86400);
+  if (valid) candidate.expiresAt = static_cast<uint64_t>(epochNow()) +
+                                  static_cast<uint64_t>(expires->valuedouble);
   cJSON_Delete(root);
-  if (!parsedFive.present && !parsedSeven.present) return false;
-  fiveHour = parsedFive;
-  sevenDay = parsedSeven;
+  if (!valid) {
+    setError(UiState::kAuthError, "Claude OAuth 续期响应无效，请重新运行 login");
+    return false;
+  }
+  if (!saveClaudeAuth(candidate)) {
+    setError(UiState::kAuthError, "Claude 新凭据写入失败，请重新运行 login");
+    return false;
+  }
+  claudeAuth = candidate;
   return true;
 }
 
-int getUsage(String& response) {
-  if (!resolveHost("chatgpt.com")) return -1;
+int getClaudeUsage(String& response) {
+  if (!resolveHost("api.anthropic.com")) return -1;
   WiFiClientSecure client;
   client.setCACertBundle(rootca_crt_bundle_start);
   HTTPClient http;
   http.setConnectTimeout(10000);
   http.setTimeout(15000);
-  if (!http.begin(client, kUsageUrl)) {
-    setError(UiState::kTransportError, "额度请求初始化失败");
+  if (!http.begin(client, kClaudeUsageUrl)) {
+    setError(UiState::kTransportError, "Claude 用量请求初始化失败");
     return -1;
   }
+  const char* headers[] = {"Retry-After"};
+  http.collectHeaders(headers, 1);
   http.addHeader("Accept", "application/json");
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + settings.accessToken);
-  http.addHeader("Chatgpt-Account-Id", settings.accountId);
-  http.addHeader("User-Agent", "codex_cli_rs/0.76.0 (ESP32-C3; quota-display)");
+  http.addHeader("Authorization", "Bearer " + claudeAuth.accessToken);
+  http.addHeader("anthropic-beta", "oauth-2025-04-20");
   const int status = http.GET();
-  response = http.getString();
+  if (status == 200) response = http.getString();
+  recordClaudeCooldown(http, status);
   http.end();
-  if (status <= 0) {
-    setError(transportState(status, client), transportDetail("额度请求", status, client));
-  }
+  if (status <= 0) setError(transportState(status, client), transportDetail("Claude 用量", status, client));
   return status;
 }
 
 bool refreshQuota() {
-  uiState = UiState::kLoading;
-  lastErrorDetail = "";
+  if (claudeAuth.pending) {
+    setError(UiState::kAuthError, "Claude 凭据需要重新授权，请运行 login");
+    return false;
+  }
   if (!connectWiFi()) return false;
-  const uint32_t now = epochNow();
-  if (settings.expiresAt == 0 || settings.expiresAt <= static_cast<uint64_t>(now) + 120) {
-    if (!refreshAccessToken()) return false;
+  // Manual refresh and reboot must respect the same server cooldown.
+  if (claudeBlockedUntil > epochNow()) {
+    setError(UiState::kRateLimitError, "Claude 接口冷却中，请稍后重试");
+    return false;
   }
-
+  bool refreshed = false;
+  if (claudeAuth.expiresAt <= static_cast<uint64_t>(epochNow()) + 120) {
+    if (!refreshClaudeToken()) return false;
+    refreshed = true;
+  }
   String response;
-  int status = getUsage(response);
-  if (status == 401) {
-    if (!refreshAccessToken()) return false;
-    status = getUsage(response);
+  int status = getClaudeUsage(response);
+  if (status == 401 && !refreshed) {
+    if (!refreshClaudeToken()) return false;
+    status = getClaudeUsage(response);
   }
-  if (status <= 0) {
-    if (lastErrorDetail.isEmpty()) {
-      setError(UiState::kTransportError, "额度请求未取得 HTTP 响应");
+  if (status != 200) {
+    if (status > 0) {
+      setError(classifyHttpStatus(status), "Claude 用量接口返回 HTTP " + String(status));
+      if (status == 401 || status == 403) {
+        // New credentials rejected, or scope missing: stop repeated token rotation.
+        claudeAuth.pending = true;
+        saveClaudeAuth(claudeAuth);
+      }
     }
     return false;
   }
-  if (status != 200) {
-    setError(classifyHttpStatus(status), "额度服务返回 HTTP " + String(status));
+  if (!claude::parseUsage(response.c_str(), fiveHour, sevenDay)) {
+    setError(UiState::kDataError, "Claude 用量响应缺少有效的 5h/7d 数据");
     return false;
   }
-  if (!parseUsage(response)) {
-    setError(UiState::kDataError, "额度响应 JSON 缺少可识别的 5h/7d 窗口");
-    return false;
-  }
-
   lastRefreshEpoch = epochNow();
   nextRefreshAtMs = millis() + static_cast<uint32_t>(settings.refreshMinutes) * 60000UL;
   retryDelaySeconds = kInitialRetryDelaySeconds;
@@ -550,7 +624,8 @@ void drawWindowLine(int16_t y, const RateWindow& window) {
   const uint32_t now = epochNow();
   const uint32_t remainSeconds = window.resetAt > now ? window.resetAt - now : 0;
   const float remaining = 100.0f - window.usedPercent;
-  const String label = window.resetAt ? formatDuration(remainSeconds) : "7d";
+  const String label = window.resetAt ? formatDuration(remainSeconds)
+      : (window.durationSeconds == claude::kFiveHourSeconds ? "5h" : "7d");
   String prefix = "[" + label + "]  " +
                   String(static_cast<int>(roundf(remaining))) + "%";
   display.setFont(u8g2_font_7x14_tf);
@@ -581,16 +656,18 @@ String formatLastRefresh() {
 
 void drawScreen() {
   display.clearBuffer();
-  drawWindowLine(20, sevenDay);
+  drawWindowLine(20, fiveHour);
+  drawWindowLine(38, sevenDay);
 
   display.setFont(u8g2_font_6x12_tf);
-  const String lastRefresh = formatLastRefresh();
-  drawUiText(0, 41, lastRefresh.c_str());
-
+  String lastRefresh = formatLastRefresh();
   const char* status = uiMessage(uiState);
+  const int16_t ageSpace = 128 - uiTextWidth(status) - (status[0] ? 6 : 0);
+  if (uiTextWidth(lastRefresh.c_str()) > ageSpace) lastRefresh = ageSpace >= 12 ? "--" : "";
+  drawUiText(0, 46, lastRefresh.c_str());
   if (status[0] != '\0') {
     const int16_t width = uiTextWidth(status);
-    drawUiText(max<int16_t>(0, 128 - width), 41, status);
+    drawUiText(max<int16_t>(0, 128 - width), 46, status);
   }
   display.sendBuffer();
 }
@@ -615,6 +692,13 @@ void handleSerialCommand(const String& line) {
   String command;
   jsonString(root, "request_id", requestId);
   jsonString(root, "cmd", command);
+  // USB retries can arrive after a refresh has rotated credentials. A repeated
+  // successful mutation acknowledges the original request without replaying it.
+  if (!requestId.isEmpty() && requestId == lastMutationId && command == lastMutationCommand) {
+    Serial.println(lastMutationReply);
+    cJSON_Delete(root);
+    return;
+  }
   cJSON* response = cJSON_CreateObject();
 
   if (requestId.isEmpty() || command.isEmpty()) {
@@ -630,27 +714,57 @@ void handleSerialCommand(const String& line) {
         cJSON_GetObjectItemCaseSensitive(root, "refresh_token") != nullptr ||
         cJSON_GetObjectItemCaseSensitive(root, "account_id") != nullptr ||
         expiresAt != nullptr;
-    const bool valid =
-        jsonString(root, "wifi_ssid", candidate.wifiSsid) &&
-        jsonString(root, "wifi_password", candidate.wifiPassword) &&
-        cJSON_IsNumber(refreshMinutes) &&
-        refreshMinutes->valuedouble >= kMinimumRefreshMinutes &&
-        refreshMinutes->valuedouble <= kMaximumRefreshMinutes &&
-        refreshMinutes->valuedouble ==
-            static_cast<uint16_t>(refreshMinutes->valuedouble) &&
-        cJSON_IsNumber(utcOffset) &&
-        utcOffset->valuedouble >= -840 && utcOffset->valuedouble <= 840 &&
-        !candidate.wifiSsid.isEmpty() &&
-        (!authFieldsProvided ||
-         (jsonString(root, "access_token", candidate.accessToken) &&
-          jsonString(root, "refresh_token", candidate.refreshToken) &&
-          jsonString(root, "account_id", candidate.accountId) &&
-          cJSON_IsNumber(expiresAt) && expiresAt->valuedouble > 0 &&
-          !candidate.accessToken.isEmpty() && !candidate.refreshToken.isEmpty() &&
-          !candidate.accountId.isEmpty()));
+    const bool keyFieldsProvided =
+        cJSON_GetObjectItemCaseSensitive(root, "deepseek_key") != nullptr ||
+        cJSON_GetObjectItemCaseSensitive(root, "openrouter_key") != nullptr;
+    const bool ssidProvided =
+        cJSON_GetObjectItemCaseSensitive(root, "wifi_ssid") != nullptr;
+    const bool passwordProvided =
+        cJSON_GetObjectItemCaseSensitive(root, "wifi_password") != nullptr;
+
+    // 部分更新：只校验并套用请求里出现的字段，其余保留设备原值。
+    bool valid = ssidProvided || passwordProvided || refreshMinutes != nullptr ||
+                 utcOffset != nullptr || authFieldsProvided || keyFieldsProvided;
+    if (ssidProvided) {
+      valid = valid && jsonString(root, "wifi_ssid", candidate.wifiSsid) &&
+              !candidate.wifiSsid.isEmpty();
+    }
+    if (passwordProvided) {
+      valid = valid && jsonString(root, "wifi_password", candidate.wifiPassword);
+    }
+    if (refreshMinutes != nullptr) {
+      valid = valid && cJSON_IsNumber(refreshMinutes) &&
+              refreshMinutes->valuedouble >= kMinimumRefreshMinutes &&
+              refreshMinutes->valuedouble <= kMaximumRefreshMinutes &&
+              refreshMinutes->valuedouble ==
+                  static_cast<uint16_t>(refreshMinutes->valuedouble);
+    }
+    if (utcOffset != nullptr) {
+      valid = valid && cJSON_IsNumber(utcOffset) &&
+              utcOffset->valuedouble >= -840 && utcOffset->valuedouble <= 840;
+    }
+    if (authFieldsProvided) {
+      valid = valid &&
+              jsonString(root, "access_token", candidate.accessToken) &&
+              jsonString(root, "refresh_token", candidate.refreshToken) &&
+              jsonString(root, "account_id", candidate.accountId) &&
+              cJSON_IsNumber(expiresAt) && expiresAt->valuedouble > 0 &&
+              !candidate.accessToken.isEmpty() && !candidate.refreshToken.isEmpty() &&
+              !candidate.accountId.isEmpty();
+    }
+    if (keyFieldsProvided) {
+      valid = valid &&
+              jsonString(root, "deepseek_key", candidate.deepseekKey) &&
+              jsonString(root, "openrouter_key", candidate.openrouterKey) &&
+              !candidate.deepseekKey.isEmpty() && !candidate.openrouterKey.isEmpty();
+    }
     if (valid) {
-      candidate.refreshMinutes = static_cast<uint16_t>(refreshMinutes->valuedouble);
-      candidate.utcOffsetMinutes = static_cast<int16_t>(utcOffset->valuedouble);
+      if (refreshMinutes != nullptr) {
+        candidate.refreshMinutes = static_cast<uint16_t>(refreshMinutes->valuedouble);
+      }
+      if (utcOffset != nullptr) {
+        candidate.utcOffsetMinutes = static_cast<int16_t>(utcOffset->valuedouble);
+      }
       if (authFieldsProvided) {
         candidate.expiresAt = static_cast<uint64_t>(expiresAt->valuedouble);
       }
@@ -660,6 +774,9 @@ void handleSerialCommand(const String& line) {
         cJSON_AddNumberToObject(response, "refresh_minutes", settings.refreshMinutes);
         WiFi.disconnect(true, false);
         refreshRequested = true;
+        nextRefreshAtMs = 0;
+        uiState = settings.configurationInvalid() ? UiState::kConfigError :
+            (settings.configured() ? UiState::kLoading : UiState::kUnconfigured);
         retryDelaySeconds = kInitialRetryDelaySeconds;
         lastErrorDetail = "";
       } else {
@@ -669,6 +786,35 @@ void handleSerialCommand(const String& line) {
     } else {
       addResponseBase(response, requestId, false);
       cJSON_AddStringToObject(response, "error", "配置字段无效");
+    }
+  } else if (command == "claude_login" && requestId == claudeAuth.provisionId) {
+    // Persisted identity also protects against a USB retry after a reboot.
+    addResponseBase(response, requestId, true);
+    cJSON_AddStringToObject(response, "provider", "claude");
+  } else if (command == "claude_login") {
+    ClaudeAuth candidate;
+    candidate.provisionId = requestId;
+    cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
+    const bool valid = jsonString(root, "access_token", candidate.accessToken) &&
+        jsonString(root, "refresh_token", candidate.refreshToken) && candidate.configured() &&
+        claude::integer(expires, kMinimumValidEpoch, UINT32_MAX);
+    if (valid) candidate.expiresAt = static_cast<uint64_t>(expires->valuedouble);
+    if (valid && saveClaudeAuth(candidate)) {
+      claudeAuth = candidate;
+      fiveHour = RateWindow{};
+      sevenDay = RateWindow{};
+      lastRefreshEpoch = 0;
+      // Keep a server cooldown even across reauthorization.
+      refreshRequested = true;
+      nextRefreshAtMs = 0;
+      retryDelaySeconds = kInitialRetryDelaySeconds;
+      lastErrorDetail = "";
+      uiState = settings.configured() ? UiState::kLoading : UiState::kUnconfigured;
+      addResponseBase(response, requestId, true);
+      cJSON_AddStringToObject(response, "provider", "claude");
+    } else {
+      addResponseBase(response, requestId, false);
+      cJSON_AddStringToObject(response, "error", valid ? "Claude 凭据写入失败" : "Claude 登录字段无效");
     }
   } else if (command == "login") {
     Settings candidate = settings;
@@ -688,6 +834,9 @@ void handleSerialCommand(const String& line) {
         cJSON_AddStringToObject(response, "account_id", settings.accountId.c_str());
         WiFi.disconnect(true, false);
         refreshRequested = true;
+        nextRefreshAtMs = 0;
+        uiState = settings.configurationInvalid() ? UiState::kConfigError :
+            (settings.configured() ? UiState::kLoading : UiState::kUnconfigured);
         retryDelaySeconds = kInitialRetryDelaySeconds;
         lastErrorDetail = "";
       } else {
@@ -700,7 +849,26 @@ void handleSerialCommand(const String& line) {
     }
   } else if (command == "status") {
     addResponseBase(response, requestId, true);
+    cJSON_AddStringToObject(response, "usage_provider", "claude");
+    cJSON_AddBoolToObject(response, "claude_configured", claudeAuth.configured());
+    cJSON_AddBoolToObject(response, "claude_needs_login", claudeAuth.pending);
+    cJSON_AddNumberToObject(response, "claude_expires_at", static_cast<double>(claudeAuth.expiresAt));
+    cJSON_AddNumberToObject(response, "claude_retry_at", claudeBlockedUntil);
+    auto addWindow = [&](const char* name, const RateWindow& window) {
+      cJSON* value = cJSON_AddObjectToObject(response, name);
+      cJSON_AddBoolToObject(value, "present", window.present);
+      if (window.present) {
+        cJSON_AddNumberToObject(value, "used_percent", window.usedPercent);
+        cJSON_AddNumberToObject(value, "reset_at", window.resetAt);
+        cJSON_AddBoolToObject(value, "expired", window.resetAt && epochNow() >= window.resetAt);
+      }
+    };
+    addWindow("five_hour", fiveHour);
+    addWindow("seven_day", sevenDay);
     cJSON_AddBoolToObject(response, "configured", settings.configured());
+    cJSON_AddBoolToObject(response, "codex_configured", settings.codexConfigured());
+    cJSON_AddBoolToObject(response, "deepseek_configured", settings.deepseekConfigured());
+    cJSON_AddBoolToObject(response, "openrouter_configured", settings.openrouterConfigured());
     cJSON_AddBoolToObject(response, "wifi_connected", WiFi.status() == WL_CONNECTED);
     cJSON_AddNumberToObject(response, "refresh_minutes", settings.refreshMinutes);
     cJSON_AddNumberToObject(response, "last_refresh", lastRefreshEpoch);
@@ -713,6 +881,8 @@ void handleSerialCommand(const String& line) {
     cJSON_AddNumberToObject(response, "wifi_rssi",
                             WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
     cJSON_AddStringToObject(response, "wifi_ip", WiFi.localIP().toString().c_str());
+    cJSON_AddBoolToObject(response, "deepseek_key_set", !settings.deepseekKey.isEmpty());
+    cJSON_AddBoolToObject(response, "openrouter_key_set", !settings.openrouterKey.isEmpty());
     cJSON_AddNumberToObject(response, "i2c_address", kDisplayI2cAddress);
     cJSON_AddNumberToObject(response, "scl_gpio9", digitalRead(pins::kI2cClock));
     cJSON_AddNumberToObject(response, "sda_gpio8", digitalRead(pins::kI2cData));
@@ -726,6 +896,16 @@ void handleSerialCommand(const String& line) {
   } else {
     addResponseBase(response, requestId, false);
     cJSON_AddStringToObject(response, "error", "未知命令");
+  }
+  if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(response, "ok")) &&
+      (command == "configure" || command == "login" || command == "claude_login" || command == "erase")) {
+    char* reply = cJSON_PrintUnformatted(response);
+    if (reply) {
+      lastMutationId = requestId;
+      lastMutationCommand = command;
+      lastMutationReply = reply;
+      cJSON_free(reply);
+    }
   }
   sendResponse(response);
   cJSON_Delete(response);
@@ -776,6 +956,7 @@ void setup() {
   uiState = settings.configurationInvalid()
       ? UiState::kConfigError
       : (settings.configured() ? UiState::kConnecting : UiState::kUnconfigured);
+  if (claudeAuth.pending) setError(UiState::kAuthError, "Claude 续期中断，请重新运行 login");
   drawScreen();
   Serial.printf("READY OLED=0x%02X SCL=%u SDA=%u\n",
                 kDisplayI2cAddress, pins::kI2cClock, pins::kI2cData);

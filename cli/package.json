@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Provision and control the ESP32-C3 Codex quota display",
+  "description": "Provision and control the ESP32-C3 Claude quota display",
   "bin": {
     "codex-quota-device": "src/cli.ts"
   },
