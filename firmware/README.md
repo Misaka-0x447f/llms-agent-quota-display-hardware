@@ -1,4 +1,4 @@
-# ESP32-C3 Claude 额度屏固件
+# ESP32-C3 多平台额度屏固件
 
 ## 直插映射
 
@@ -22,19 +22,21 @@
 ## 构建与烧录
 
 ```bash
-PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware
-PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -t upload \
+PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -e esp32c3_supermini
+PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -e esp32c3_supermini -t upload \
   --upload-port /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_*-if00
 ```
 
 串口为 115200 baud。固件使用 NVS 明文保存 Wi-Fi 和 Claude 凭据；当前阶段
-没有启用 ESP32 Flash Encryption。旧 Codex、DeepSeek 和 OpenRouter 配置保留，
-但不再采集或显示。Claude 凭据存入独立的 `claude_auth` NVS 值，不复用旧令牌。
+没有启用 ESP32 Flash Encryption。默认显示 Claude 7 天额度、DeepSeek 和
+OpenRouter 余额；Claude 凭据存入独立的 `claude_auth` NVS 值，不复用旧令牌。
 
-烧录后在电脑运行 `pnpm --dir cli codex-quota-device login` 单独授权 Claude。
-电脑退出后，ESP32 自己请求用量及续期。屏幕第一行显示 5 小时窗口，第二行显示
-7 天窗口，第三行显示更新时间和状态。首次授权与设备续期都成功后，才算验证了
-独立运行能力。`login` 成功仅确认串口写入，不确认上游接口可用。
+默认固件使用 `pnpm --dir cli codex-quota-device login --provider claude` 授权。
+
+电脑退出后，ESP32 自己请求用量及续期。屏幕第一行显示 Claude 7 天窗口，
+随后是 DeepSeek/OpenRouter 余额和更新状态；Claude 5 小时窗口只解析不绘制。
+首次授权与设备续期都成功后，才算验证了独立运行能力。`login` 成功仅确认串口
+写入，不确认上游接口可用。
 
 NVS 在续期前记录进行中状态，成功后一次写入新令牌对及过期时间；如果重启时
 仍处于进行中状态，设备要求重新登录，避免重复使用可能已经被消费的刷新令牌。

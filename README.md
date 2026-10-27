@@ -1,28 +1,68 @@
-# Claude 额度硬件屏
+# 多平台额度硬件屏
+
+## 默认显示：Claude 7 天 + deepseek + openrouter
+
+默认 `esp32c3_supermini` 固件显示 Claude 的 **7 天窗口**，下面依次显示
+DeepSeek 和 OpenRouter 余额，底部保留更新时间和状态。例如（示意数值）：
+
+```text
+[3d] Δ-4h     40%
+deepseek     12.34
+openrouter   56.78
+<1m 前
+```
+
+Claude 行左侧将重置倒计时和 Δ 组成一组，剩余百分比独立贴右对齐。Claude 的
+5 小时窗口仍会解析并出现在 `list` 中，但屏幕不绘制。
+平台全名使用 6×12 字体左对齐；金额使用 7×14 字体，不显示单位，保留两位小数并统一右对齐。未取得余额时显示 `--`；
+某个平台请求失败时保留其上次成功值，在平台名后加 `*`，仍继续请求其他平台。
+DeepSeek 只读取 CNY 人民币余额，缺失或无效时保留旧值并标记异常，不回退 USD；OpenRouter 显示
+账户 `total_credits - total_usage`，其 `/api/v1/credits` 接口要求 management key。
+默认刷新间隔仍为 50 秒，Δ 在 ±1 小时内仍按 5 分钟舍入。
+
+```bash
+PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -e esp32c3_supermini
+pnpm --dir cli codex-quota-device login --provider claude
+```
+
+已有 Wi-Fi、Claude、DeepSeek、OpenRouter 和旧 Codex 凭据均保留，切换固件无需
+清空配置。`login` 默认 Claude；`list` 的 `usage_provider` 固定为 `claude`，
+并返回 `deepseek_balance`、`openrouter_balance` 的余额、币种及过期标记。
+旧 `login --provider codex` 仍可写入旧凭据，但固件不再轮询或显示 Codex。
+
+## Claude 显示细节
 
 ESP32-C3 SuperMini + 128×64 I²C OLED 的个人订阅额度显示器。电脑仅用于初次
 OAuth 授权、重新登录和配置；正常运行时由 ESP32 自己通过 Wi-Fi 请求 Claude
 用量接口并续期，不需要电脑常驻程序或中转服务器。
 
-屏幕只显示 Claude，固定三行（以下数值仅为布局示意）：
+屏幕固定四行（以下数值仅为布局示意）：
 
 ```text
-[3h]  80% Δ+1h
-[3d]  40% Δ-4h
+[3d] Δ-4h     40%
+deepseek     12.34
+openrouter   56.78
 5m 前    正在刷新
 ```
 
-- 第一行：5 小时窗口，行首方括号显示距重置的剩余时间，随后是剩余百分比和配速 `Δ`。
-- 第二行：7 天窗口，同样以距重置的剩余时间开头；行首不是固定的 `5h` / `7d` 标签。
-- 第三行：距最后一次成功获取用量的时间，以及当前状态或中文错误。
+- 第一行：Claude 7 天窗口，行首方括号显示距重置的剩余时间，右侧是剩余百分比，中间是配速 `Δ`。
+- 第二、三行：DeepSeek 和 OpenRouter 余额。
+- 第四行：距最后一次成功获取用量的时间，以及当前状态或中文错误。
+
+Claude 的 5 小时窗口仍会被解析，并出现在 `list` 的 `five_hour` 字段中，
+但屏幕不再绘制。
 
 `剩余百分比 = 100 - utilization`。配速以剩余额度折算的可用时间，减去实际
-距重置的时间；正值表示额度消耗比时间进度慢，负值表示快。两档都保留配速。
-屏幕不使用进度条。两行复用原版额度行布局，整行固定 7×14 字体；百分比与 Δ
+距重置的时间；正值表示额度消耗比时间进度慢，负值表示快。7 天窗口保留配速；
+5 小时窗口只解析数据，不绘制配速。
+当 Δ 在 −1 小时到 +1 小时之间（含边界），固定以 5 分钟为步长四舍五入：
+`+3m → +5m`、`−3m → −5m`，半档 `±2m30s → ±5m`；舍入为零统一显示
+`+0m`，边界显示 `±60m`。超过 1 小时沿用原有小时/天格式。
+屏幕不使用进度条。7 天额度行复用原版额度行布局，整行固定 7×14 字体；百分比与 Δ
 间隔 4 像素，Δ 后文字从其起点右移 9 像素绘制，不自动缩小字体。
 
-接口缺失或返回 `null` 的窗口沿用原版行为，整行隐藏。百分比存在但重置时间
-未知时，行首回退为该窗口的 `[5h]` 或 `[7d]`，配速显示 `--`。请求失败保留本次
+接口缺失或返回 `null` 的 7 天窗口沿用原版行为，整行隐藏。百分比存在但重置时间
+未知时，行首回退为 `[7d]`，配速显示 `--`。请求失败保留本次
 开机以来的最后成功数据及其更新时间；倒计时到零后显示 `[0m]`，百分比仍是最后
 采样值，直到下次成功抓取，不会自行假定额度已经恢复。
 
@@ -37,17 +77,20 @@ OAuth 授权、重新登录和配置；正常运行时由 ESP32 自己通过 Wi-
 pnpm --dir cli install
 pnpm --dir cli codex-quota-device update \
   --ssid '你的 Wi-Fi' \
-  --interval 5 \
+  --interval-seconds 50 \
   --utc-offset +08:00
 
-pnpm --dir cli codex-quota-device login
+pnpm --dir cli codex-quota-device login --provider claude
 ```
 
 改 SSID 而不传 `--password` 时，CLI 会隐藏输入 Wi-Fi 密码。`update` 只更新
-指定参数，不触发 OAuth。刷新间隔支持 1～1440 分钟；无效的持久化间隔会停止
-刷新并显示“配置无效”，不会静默回退。建议先使用默认 5 分钟。
+指定参数，不触发 OAuth。默认刷新间隔为 50 秒（成功获取后等待 50 秒再次请求）。
+`--interval-seconds` 支持 50～86400 整数秒；旧 `--interval` 仍支持 1～1440
+整数分钟，两者不可同时指定。升级旧分钟制固件后，旧刷新间隔统一改为 50 秒，
+Wi-Fi 和凭据保留；后续设置的秒级间隔会跨重启保留。无效的秒级持久化间隔
+会停止刷新并显示“配置无效”，不会静默回退。
 
-`login` 默认选择 Claude（也可显式传 `--provider claude`）。CLI 先检查设备
+请使用 `login --provider claude`。CLI 先检查设备
 是否支持 Claude，再发起独立的 PKCE OAuth 授权，不读取电脑上 Claude Code 的
 凭据。浏览器回调地址是 `http://localhost:54545/callback`；无法自动回跳时，
 可在 CLI 中粘贴完整回调 URL。可使用 `--no-browser` 自行打开授权页。
@@ -56,16 +99,16 @@ pnpm --dir cli codex-quota-device login
 文件，也不输出令牌值；诊断仅输出字段名称、大小及脱敏值。登录成功只表示
 凭据已写入，是否实际抓取成功以屏幕或 `list` 的状态为准。
 
-旧 Wi-Fi 配置及旧平台凭据保留，但本版本只轮询和显示 Claude。旧 Codex 授权
-仍可通过 `login --provider codex` 写入；旧余额 key 配置选项也保留兼容，不再
-影响屏幕。`erase` 会清除全部设备配置，包括旧平台凭据。
+旧 Wi-Fi 配置及旧平台凭据保留，但当前固件只轮询和显示 Claude。旧 Codex 授权
+仍可通过 `login --provider codex` 写入，但不再影响屏幕；旧余额 key 配置选项
+保留兼容。`erase` 会清除全部设备配置，包括旧平台凭据。
 
 ## 日常操作
 
 ```bash
 pnpm --dir cli codex-quota-device list
 pnpm --dir cli codex-quota-device fetchNow
-pnpm --dir cli codex-quota-device update --interval 10
+pnpm --dir cli codex-quota-device update --interval-seconds 50
 pnpm --dir cli codex-quota-device erase
 ```
 
@@ -73,8 +116,10 @@ pnpm --dir cli codex-quota-device erase
 按设备 `#` 键或执行 `fetchNow` 可请求刷新。手动刷新同样遵守接口限流等待时间。
 
 `list` 返回 `usage_provider: "claude"`、是否已配置、是否需要登录、令牌过期
-时间、接口冷却截止时间和两档用量，不返回凭据。注意串口中的 `used_percent`
-是**已用**百分比，屏幕是**剩余**百分比；`reset_at` 是 Unix 秒。
+时间、接口冷却截止时间和两档用量（屏幕只绘制 7 天），不返回凭据。注意串口中
+的 `used_percent` 是**已用**百分比，屏幕是**剩余**百分比；`reset_at` 是 Unix 秒。
+`refresh_seconds` 是配置的刷新间隔；兼容字段 `refresh_minutes` 为等值分钟数，
+50 秒时它为小数。
 
 设备在抓取前检查访问令牌，距过期不足 120 秒时先续期；用量接口返回 401 时
 最多续期一次并重试。刷新间隔很长时，可在访问令牌已经过期后用刷新令牌续期。

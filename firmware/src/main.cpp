@@ -9,6 +9,10 @@
 
 #include "ui_glyphs.h"
 #include "claude_protocol.h"
+#include "quota_settings.h"
+#include "delta_format.h"
+#include "balance_protocol.h"
+
 
 namespace pins {
 constexpr uint8_t kI2cClock = 9;
@@ -25,8 +29,6 @@ constexpr uint32_t kI2cFrequency = 100000;
 constexpr uint32_t kDebounceMs = 25;
 constexpr uint32_t kIdleRedrawMs = 60000;
 constexpr uint32_t kMinimumValidEpoch = 1700000000UL;
-constexpr uint16_t kMinimumRefreshMinutes = 1;
-constexpr uint16_t kMaximumRefreshMinutes = 1440;
 constexpr uint32_t kInitialRetryDelaySeconds = 30;
 constexpr uint32_t kMaximumRetryDelaySeconds = 15 * 60;
 constexpr size_t kMaximumSerialCommandBytes = 64 * 1024;
@@ -87,7 +89,7 @@ struct Settings {
   String deepseekKey;
   String openrouterKey;
   uint64_t expiresAt = 0;
-  uint16_t refreshMinutes = 5;
+  uint32_t refreshSeconds = quota::kDefaultRefreshSeconds;
   int16_t utcOffsetMinutes = 0;
 
   bool codexConfigured() const {
@@ -98,15 +100,13 @@ struct Settings {
 
   bool openrouterConfigured() const { return !openrouterKey.isEmpty(); }
 
-  // 本版本只采集和显示 Claude；保留旧配置但不再轮询旧数据源。
+  // 本版本只采集和显示 Claude；保留旧平台凭据但不再轮询旧数据源。
   bool credentialsPresent() const {
-    return !wifiSsid.isEmpty() &&
-           claudeAuth.configured();
+    return !wifiSsid.isEmpty() && claudeAuth.configured();
   }
 
   bool refreshIntervalValid() const {
-    return refreshMinutes >= kMinimumRefreshMinutes &&
-           refreshMinutes <= kMaximumRefreshMinutes;
+    return quota::validRefreshSeconds(refreshSeconds);
   }
 
   bool configured() const {
@@ -131,6 +131,10 @@ struct Key {
 Settings settings;
 RateWindow fiveHour;
 RateWindow sevenDay;
+balance_protocol::Balance deepseekBalance;
+balance_protocol::Balance openrouterBalance;
+bool deepseekStale = false;
+bool openrouterStale = false;
 UiState uiState = UiState::kUnconfigured;
 String lastErrorDetail;
 Key keys[] = {
@@ -295,7 +299,8 @@ void loadSettings() {
   settings.deepseekKey = preferences.getString("deepseek");
   settings.openrouterKey = preferences.getString("openrouter");
   settings.expiresAt = preferences.getULong64("expires", 0);
-  settings.refreshMinutes = preferences.getUShort("period", 5);
+  // Upgrade legacy minute-based settings to the new 50-second default.
+  settings.refreshSeconds = preferences.getUInt("period_s", quota::kDefaultRefreshSeconds);
   settings.utcOffsetMinutes = preferences.getShort("utc_off", 0);
 }
 
@@ -325,7 +330,7 @@ bool saveSettings() {
     preferences.remove("openrouter");
   }
   ok &= preferences.putULong64("expires", settings.expiresAt) > 0;
-  ok &= preferences.putUShort("period", settings.refreshMinutes) > 0;
+  ok &= preferences.putUInt("period_s", settings.refreshSeconds) > 0;
   ok &= preferences.putShort("utc_off", settings.utcOffsetMinutes) > 0;
   return ok;
 }
@@ -335,6 +340,9 @@ void clearSettings() {
   settings = Settings{};
   claudeAuth = ClaudeAuth{};
   claudeBlockedUntil = 0;
+  deepseekBalance = balance_protocol::Balance{};
+  openrouterBalance = balance_protocol::Balance{};
+  deepseekStale = openrouterStale = false;
   fiveHour = RateWindow{};
   sevenDay = RateWindow{};
   lastRefreshEpoch = 0;
@@ -511,7 +519,7 @@ int getClaudeUsage(String& response) {
   return status;
 }
 
-bool refreshQuota() {
+bool refreshClaudeQuota() {
   if (claudeAuth.pending) {
     setError(UiState::kAuthError, "Claude 凭据需要重新授权，请运行 login");
     return false;
@@ -549,7 +557,69 @@ bool refreshQuota() {
     return false;
   }
   lastRefreshEpoch = epochNow();
-  nextRefreshAtMs = millis() + static_cast<uint32_t>(settings.refreshMinutes) * 60000UL;
+  nextRefreshAtMs = millis() + settings.refreshSeconds * 1000UL;
+  retryDelaySeconds = kInitialRetryDelaySeconds;
+  uiState = UiState::kReady;
+  lastErrorDetail = "";
+  return true;
+}
+
+bool refreshBalance(const char* host, const char* url, const String& key,
+                    bool (*parse)(const char*, balance_protocol::Balance&),
+                    balance_protocol::Balance& balance) {
+  if (!resolveHost(host)) return false;
+  WiFiClientSecure client;
+  client.setCACertBundle(rootca_crt_bundle_start);
+  HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(15000);
+  if (!http.begin(client, url)) {
+    setError(UiState::kTransportError, String(host) + " 请求初始化失败");
+    return false;
+  }
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Authorization", "Bearer " + key);
+  const int status = http.GET();
+  const String body = http.getString();
+  http.end();
+  if (status <= 0) {
+    setError(transportState(status, client), transportDetail(host, status, client));
+    return false;
+  }
+  if (status != 200) {
+    setError(classifyHttpStatus(status), String(host) + " HTTP " + String(status));
+    return false;
+  }
+  if (!parse(body.c_str(), balance)) {
+    setError(UiState::kDataError, String(host) + " 余额响应无效");
+    return false;
+  }
+  return true;
+}
+
+bool refreshQuota() {
+  if (!connectWiFi()) return false;
+  bool ok = true;
+  UiState firstError = UiState::kReady;
+  String firstDetail;
+  auto record = [&](bool success) {
+    if (!success && ok) { firstError = uiState; firstDetail = lastErrorDetail; }
+    ok = ok && success;
+  };
+  if (claudeAuth.configured()) record(refreshClaudeQuota());
+  if (settings.deepseekConfigured()) {
+    deepseekStale = !refreshBalance("api.deepseek.com", "https://api.deepseek.com/user/balance",
+        settings.deepseekKey, balance_protocol::parseDeepSeek, deepseekBalance);
+    record(!deepseekStale);
+  }
+  if (settings.openrouterConfigured()) {
+    openrouterStale = !refreshBalance("openrouter.ai", "https://openrouter.ai/api/v1/credits",
+        settings.openrouterKey, balance_protocol::parseOpenRouter, openrouterBalance);
+    record(!openrouterStale);
+  }
+  if (!ok) { setError(firstError, firstDetail); return false; }
+  lastRefreshEpoch = epochNow();
+  nextRefreshAtMs = millis() + settings.refreshSeconds * 1000UL;
   retryDelaySeconds = kInitialRetryDelaySeconds;
   uiState = UiState::kReady;
   lastErrorDetail = "";
@@ -619,17 +689,20 @@ void drawUiText(int16_t x, int16_t top, const char* text) {
   }
 }
 
-void drawWindowLine(int16_t y, const RateWindow& window) {
+void drawWindowLine(int16_t y, const RateWindow& window, bool rightAlignPercent = false) {
   if (!window.present) return;
   const uint32_t now = epochNow();
   const uint32_t remainSeconds = window.resetAt > now ? window.resetAt - now : 0;
   const float remaining = 100.0f - window.usedPercent;
   const String label = window.resetAt ? formatDuration(remainSeconds)
       : (window.durationSeconds == claude::kFiveHourSeconds ? "5h" : "7d");
-  String prefix = "[" + label + "]  " +
-                  String(static_cast<int>(roundf(remaining))) + "%";
+  const String percent = String(static_cast<int>(roundf(remaining))) + "%";
+  const String prefix = "[" + label + "]" + (rightAlignPercent ? "" : "  " + percent);
   display.setFont(u8g2_font_7x14_tf);
   display.drawStr(0, y, prefix.c_str());
+  if (rightAlignPercent) {
+    display.drawStr(128 - display.getStrWidth(percent.c_str()), y, percent.c_str());
+  }
 
   const int16_t x = display.getStrWidth(prefix.c_str()) + 4;
   drawDeltaGlyph(x, y);
@@ -640,6 +713,11 @@ void drawWindowLine(int16_t y, const RateWindow& window) {
   const float expectedRemaining = remaining *
                                   static_cast<float>(window.durationSeconds) / 100.0f;
   const float rawDelta = static_cast<float>(remainSeconds) - expectedRemaining;
+  char minuteDelta[8];
+  if (quota::formatMinuteDelta(-rawDelta, minuteDelta, sizeof(minuteDelta))) {
+    display.drawStr(x + 9, y, minuteDelta);
+    return;
+  }
   const char sign = rawDelta >= 0 ? '-' : '+';
   const uint32_t magnitude = static_cast<uint32_t>(fabsf(rawDelta));
   const String delta = String(sign) + formatDuration(magnitude, magnitude >= 86400);
@@ -654,20 +732,35 @@ String formatLastRefresh() {
   return String(elapsedSeconds / 60) + "m 前";
 }
 
+void drawBalanceLine(int16_t y, const char* label,
+                     const balance_protocol::Balance& balance, bool stale) {
+  display.setFont(u8g2_font_6x12_tf);
+  display.drawStr(0, y, label);
+  if (balance.present && stale) {
+    display.drawStr(display.getStrWidth(label) + 1, y, "*");
+  }
+  // Keep both decimal points aligned, even when only one balance is stale.
+  display.setFont(u8g2_font_7x14_tf);
+  const String amount = balance.present ? String(balance.remaining, 2) : "--";
+  display.drawStr(128 - display.getStrWidth(amount.c_str()), y, amount.c_str());
+}
+
 void drawScreen() {
   display.clearBuffer();
-  drawWindowLine(20, fiveHour);
-  drawWindowLine(38, sevenDay);
+  drawWindowLine(14, sevenDay, true);
+  drawBalanceLine(30, "deepseek", deepseekBalance, deepseekStale);
+  drawBalanceLine(46, "openrouter", openrouterBalance, openrouterStale);
+  const int16_t statusTop = 51;
 
   display.setFont(u8g2_font_6x12_tf);
   String lastRefresh = formatLastRefresh();
   const char* status = uiMessage(uiState);
   const int16_t ageSpace = 128 - uiTextWidth(status) - (status[0] ? 6 : 0);
   if (uiTextWidth(lastRefresh.c_str()) > ageSpace) lastRefresh = ageSpace >= 12 ? "--" : "";
-  drawUiText(0, 46, lastRefresh.c_str());
+  drawUiText(0, statusTop, lastRefresh.c_str());
   if (status[0] != '\0') {
     const int16_t width = uiTextWidth(status);
-    drawUiText(max<int16_t>(0, 128 - width), 46, status);
+    drawUiText(max<int16_t>(0, 128 - width), statusTop, status);
   }
   display.sendBuffer();
 }
@@ -707,6 +800,7 @@ void handleSerialCommand(const String& line) {
   } else if (command == "configure") {
     Settings candidate = settings;
     cJSON* refreshMinutes = cJSON_GetObjectItemCaseSensitive(root, "refresh_minutes");
+    cJSON* refreshSeconds = cJSON_GetObjectItemCaseSensitive(root, "refresh_seconds");
     cJSON* utcOffset = cJSON_GetObjectItemCaseSensitive(root, "utc_offset_minutes");
     cJSON* expiresAt = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
     const bool authFieldsProvided =
@@ -724,6 +818,7 @@ void handleSerialCommand(const String& line) {
 
     // 部分更新：只校验并套用请求里出现的字段，其余保留设备原值。
     bool valid = ssidProvided || passwordProvided || refreshMinutes != nullptr ||
+                 refreshSeconds != nullptr ||
                  utcOffset != nullptr || authFieldsProvided || keyFieldsProvided;
     if (ssidProvided) {
       valid = valid && jsonString(root, "wifi_ssid", candidate.wifiSsid) &&
@@ -732,13 +827,7 @@ void handleSerialCommand(const String& line) {
     if (passwordProvided) {
       valid = valid && jsonString(root, "wifi_password", candidate.wifiPassword);
     }
-    if (refreshMinutes != nullptr) {
-      valid = valid && cJSON_IsNumber(refreshMinutes) &&
-              refreshMinutes->valuedouble >= kMinimumRefreshMinutes &&
-              refreshMinutes->valuedouble <= kMaximumRefreshMinutes &&
-              refreshMinutes->valuedouble ==
-                  static_cast<uint16_t>(refreshMinutes->valuedouble);
-    }
+    valid = valid && quota::readRefreshSeconds(root, candidate.refreshSeconds);
     if (utcOffset != nullptr) {
       valid = valid && cJSON_IsNumber(utcOffset) &&
               utcOffset->valuedouble >= -840 && utcOffset->valuedouble <= 840;
@@ -759,9 +848,6 @@ void handleSerialCommand(const String& line) {
               !candidate.deepseekKey.isEmpty() && !candidate.openrouterKey.isEmpty();
     }
     if (valid) {
-      if (refreshMinutes != nullptr) {
-        candidate.refreshMinutes = static_cast<uint16_t>(refreshMinutes->valuedouble);
-      }
       if (utcOffset != nullptr) {
         candidate.utcOffsetMinutes = static_cast<int16_t>(utcOffset->valuedouble);
       }
@@ -771,7 +857,8 @@ void handleSerialCommand(const String& line) {
       settings = candidate;
       if (saveSettings()) {
         addResponseBase(response, requestId, true);
-        cJSON_AddNumberToObject(response, "refresh_minutes", settings.refreshMinutes);
+        cJSON_AddNumberToObject(response, "refresh_minutes", settings.refreshSeconds / 60.0);
+        cJSON_AddNumberToObject(response, "refresh_seconds", settings.refreshSeconds);
         WiFi.disconnect(true, false);
         refreshRequested = true;
         nextRefreshAtMs = 0;
@@ -804,7 +891,7 @@ void handleSerialCommand(const String& line) {
       fiveHour = RateWindow{};
       sevenDay = RateWindow{};
       lastRefreshEpoch = 0;
-      // Keep a server cooldown even across reauthorization.
+      // A fresh authorization must trigger an immediate fetch.
       refreshRequested = true;
       nextRefreshAtMs = 0;
       retryDelaySeconds = kInitialRetryDelaySeconds;
@@ -850,6 +937,7 @@ void handleSerialCommand(const String& line) {
   } else if (command == "status") {
     addResponseBase(response, requestId, true);
     cJSON_AddStringToObject(response, "usage_provider", "claude");
+    cJSON_AddBoolToObject(response, "claude_supported", true);
     cJSON_AddBoolToObject(response, "claude_configured", claudeAuth.configured());
     cJSON_AddBoolToObject(response, "claude_needs_login", claudeAuth.pending);
     cJSON_AddNumberToObject(response, "claude_expires_at", static_cast<double>(claudeAuth.expiresAt));
@@ -865,12 +953,24 @@ void handleSerialCommand(const String& line) {
     };
     addWindow("five_hour", fiveHour);
     addWindow("seven_day", sevenDay);
+    auto addBalance = [&](const char* name, const balance_protocol::Balance& balance, bool stale) {
+      cJSON* value = cJSON_AddObjectToObject(response, name);
+      cJSON_AddBoolToObject(value, "present", balance.present);
+      cJSON_AddBoolToObject(value, "stale", stale);
+      if (balance.present) {
+        cJSON_AddNumberToObject(value, "remaining", balance.remaining);
+        cJSON_AddStringToObject(value, "currency", balance.currency);
+      }
+    };
+    addBalance("deepseek_balance", deepseekBalance, deepseekStale);
+    addBalance("openrouter_balance", openrouterBalance, openrouterStale);
     cJSON_AddBoolToObject(response, "configured", settings.configured());
     cJSON_AddBoolToObject(response, "codex_configured", settings.codexConfigured());
     cJSON_AddBoolToObject(response, "deepseek_configured", settings.deepseekConfigured());
     cJSON_AddBoolToObject(response, "openrouter_configured", settings.openrouterConfigured());
     cJSON_AddBoolToObject(response, "wifi_connected", WiFi.status() == WL_CONNECTED);
-    cJSON_AddNumberToObject(response, "refresh_minutes", settings.refreshMinutes);
+    cJSON_AddNumberToObject(response, "refresh_minutes", settings.refreshSeconds / 60.0);
+    cJSON_AddNumberToObject(response, "refresh_seconds", settings.refreshSeconds);
     cJSON_AddNumberToObject(response, "last_refresh", lastRefreshEpoch);
     const int32_t nextMs = static_cast<int32_t>(nextRefreshAtMs - millis());
     cJSON_AddNumberToObject(response, "next_refresh_seconds",
@@ -956,7 +1056,6 @@ void setup() {
   uiState = settings.configurationInvalid()
       ? UiState::kConfigError
       : (settings.configured() ? UiState::kConnecting : UiState::kUnconfigured);
-  if (claudeAuth.pending) setError(UiState::kAuthError, "Claude 续期中断，请重新运行 login");
   drawScreen();
   Serial.printf("READY OLED=0x%02X SCL=%u SDA=%u\n",
                 kDisplayI2cAddress, pins::kI2cClock, pins::kI2cData);
