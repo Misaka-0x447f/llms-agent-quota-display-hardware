@@ -775,6 +775,38 @@ String formatLastRefresh() {
   return String(elapsedSeconds / 60) + "m 前";
 }
 
+// 多个余额用 + 拼接，+ 左右各留 1px，避免与两侧数字贴在一起。
+constexpr int16_t kJoinPadding = 1;
+
+int16_t joinedAmountWidth(const char* text) {
+  int16_t width = display.getStrWidth(text);
+  for (const char* cursor = text; *cursor != '\0'; ++cursor) {
+    if (*cursor == '+') width += 2 * kJoinPadding;
+  }
+  return width;
+}
+
+void drawJoinedAmount(int16_t x, int16_t y, const char* text) {
+  char segment[32];
+  size_t length = 0;
+  for (const char* cursor = text;; ++cursor) {
+    if (*cursor != '\0' && *cursor != '+') {
+      if (length + 1 < sizeof(segment)) segment[length++] = *cursor;
+      continue;
+    }
+    if (length > 0) {
+      segment[length] = '\0';
+      display.drawStr(x, y, segment);
+      x += display.getStrWidth(segment);
+      length = 0;
+    }
+    if (*cursor == '\0') return;
+    x += kJoinPadding;
+    display.drawStr(x, y, "+");
+    x += display.getStrWidth("+") + kJoinPadding;
+  }
+}
+
 void drawBalanceLine(int16_t y, const char* label, const BalanceGroup& group) {
   char amount[96];
   if (!balance_format::joined(group.values, group.count, amount, sizeof(amount))) {
@@ -806,7 +838,7 @@ void drawBalanceLine(int16_t y, const char* label, const BalanceGroup& group) {
     labelWidth = layout.showLabel ? display.getStrWidth(label) : 0;
     const int16_t markerWidth = stale ? display.getStrWidth("*") : 0;
     display.setFont(layout.amountFont);
-    amountWidth = display.getStrWidth(amount);
+    amountWidth = joinedAmountWidth(amount);
     const int16_t marker = layout.showLabel ? labelWidth + markerWidth + 1 : markerWidth + 2;
     const int16_t needed = marker + (layout.showLabel ? 2 : 0) + amountWidth;
     if (needed <= 128) {
@@ -823,9 +855,9 @@ void drawBalanceLine(int16_t y, const char* label, const BalanceGroup& group) {
     display.drawStr(0, y, "*");
   }
   display.setFont(chosen->amountFont);
-  amountWidth = display.getStrWidth(amount);
+  amountWidth = joinedAmountWidth(amount);
   const int16_t x = amountWidth < 128 ? 128 - amountWidth : 0;
-  display.drawStr(x, y, amount);
+  drawJoinedAmount(x, y, amount);
 }
 
 void drawScreen() {
