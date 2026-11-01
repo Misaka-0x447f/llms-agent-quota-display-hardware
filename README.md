@@ -14,8 +14,12 @@ openrouter   56.78
 
 Claude 行左侧将重置倒计时和 Δ 组成一组，剩余百分比独立贴右对齐。Claude 的
 5 小时窗口仍会解析并出现在 `list` 中，但屏幕不绘制。
-平台全名使用 6×12 字体左对齐；金额使用 7×14 字体，不显示单位，保留两位小数并统一右对齐。未取得余额时显示 `--`；
-某个平台请求失败时保留其上次成功值，在平台名后加 `*`，仍继续请求其他平台。
+平台全名使用 6×12 字体左对齐；金额使用 7×14 字体，不显示单位，统一右对齐。
+每个平台最多可配置 4 个 API key：同一平台的多个余额按配置顺序用 `+` 连接，
+2 个及以上 key 时每个金额保留一位小数（如 `12.0+24.0`），单个 key 仍保留两位
+小数（如 `12.34`）。key 较多、整行放不下时金额字体逐级缩小；仍放不下时省略
+平台名。未取得余额的位置显示 `--`；某个 key 请求失败时保留它上次成功的值，
+并在平台名后加 `*`，其他 key 继续更新。
 DeepSeek 只读取 CNY 人民币余额，缺失或无效时保留旧值并标记异常，不回退 USD；OpenRouter 显示
 账户 `total_credits - total_usage`，其 `/api/v1/credits` 接口要求 management key。
 默认刷新间隔为 5 分钟（300 秒），Δ 在 ±1 小时内仍按 5 分钟舍入。
@@ -28,6 +32,8 @@ pnpm --dir cli codex-quota-device login --provider claude
 已有 Wi-Fi、Claude、DeepSeek、OpenRouter 和旧 Codex 凭据均保留，切换固件无需
 清空配置。`login` 默认 Claude；`list` 的 `usage_provider` 固定为 `claude`，
 并返回 `deepseek_balance`、`openrouter_balance` 的余额、币种及过期标记。
+多个 key 时 `deepseek_balances`、`openrouter_balances` 逐项返回每个 key 的余额，
+汇总对象的 `remaining` 是已取得余额的合计。
 旧 `login --provider codex` 仍可写入旧凭据，但固件不再轮询或显示 Codex。
 
 ## Claude 显示细节
@@ -91,6 +97,21 @@ pnpm --dir cli codex-quota-device login --provider claude
 间隔的设备会沿用原值（例如之前保存的 50 秒或 3 分钟），需要显式执行
 `update --interval-seconds 300`。后续设置的秒级间隔会跨重启保留。无效的秒级
 持久化间隔会停止刷新并显示“配置无效”，不会静默回退。
+
+### 多个 API Key
+
+`--deepseek-key` 和 `--openrouter-key` 可以分别独立更新，都可重复传入或用逗号
+分隔，每个平台最多 4 个 key：
+
+```bash
+pnpm --dir cli codex-quota-device update \
+  --deepseek-key 'sk-...甲' --deepseek-key 'sk-...乙' \
+  --openrouter-key 'sk-or-...甲,sk-or-...乙'
+```
+
+设备按配置顺序逐个请求 key；某个 key 失败时保留它上次成功的余额，其他 key
+继续更新。`list` 的 `deepseek_balances`、`openrouter_balances` 数组逐项给出
+每个 key 的 `remaining`、`stale` 和币种（不返回 key 本身）。
 
 请使用 `login --provider claude`。CLI 先检查设备
 是否支持 Claude，再发起独立的 PKCE OAuth 授权，不读取电脑上 Claude Code 的

@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { CliError } from "../src/errors.js";
-import { parseRefreshInterval, parseUtcOffset, run } from "../src/cli.js";
+import {
+  MAX_API_KEYS,
+  parseApiKeys,
+  parseRefreshInterval,
+  parseUtcOffset,
+  run,
+} from "../src/cli.js";
 
 test("parses positive and negative UTC offsets", () => {
   assert.equal(parseUtcOffset("+08:00"), 480);
@@ -49,4 +55,30 @@ test("rejects conflicting interval options before resolving a serial port", asyn
 
 test("validates the seconds option before resolving a serial port", async () => {
   await assert.rejects(run(["update", "--interval-seconds", "49"]), /50～86400 秒/);
+});
+
+test("accepts repeated, comma separated and newline separated API keys", () => {
+  assert.deepEqual(parseApiKeys(["k1", "k2"], "--deepseek-key"), ["k1", "k2"]);
+  assert.deepEqual(parseApiKeys(["k1,k2\nk3"], "--deepseek-key"), ["k1", "k2", "k3"]);
+  assert.deepEqual(parseApiKeys([" k1 ", "k1"], "--deepseek-key"), ["k1"]);
+  assert.deepEqual(parseApiKeys(undefined, "--openrouter-key"), []);
+});
+
+test("validates each API key list", () => {
+  assert.throws(() => parseApiKeys([""], "--deepseek-key"), /不能为空/);
+  assert.throws(() => parseApiKeys([" , "], "--openrouter-key"), /不能为空/);
+  assert.throws(
+    () => parseApiKeys(["a", "b", "c", "d", "e"], "--deepseek-key"),
+    /最多支持 4 个/,
+  );
+  assert.equal(MAX_API_KEYS, 4);
+  assert.throws(() => parseApiKeys(["k".repeat(129)], "--deepseek-key"), /128/);
+  assert.doesNotThrow(() => parseApiKeys(["k".repeat(128)], "--deepseek-key"));
+});
+
+test("validates keys before resolving a serial port", async () => {
+  await assert.rejects(
+    run(["update", "--deepseek-key", "a,b,c,d,e"]),
+    /最多支持 4 个/,
+  );
 });

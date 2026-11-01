@@ -24,8 +24,8 @@ const HELP = `ESP32-C3 额度屏配置工具（Claude）
 update 选项（至少指定一个；未指定的参数保持设备原值不变）：
   --ssid SSID           更新 Wi-Fi 名称（改 SSID 而未给 --password 时会交互提示密码）
   --password PASSWORD   更新 Wi-Fi 密码
-  --deepseek-key KEY    更新 DeepSeek 余额配置（两个 key 成对更新）
-  --openrouter-key KEY  更新 OpenRouter 余额配置
+  --deepseek-key KEY     更新 DeepSeek 余额 key；可重复或用逗号分隔，最多 4 个
+  --openrouter-key KEY   更新 OpenRouter 余额 key；可重复或用逗号分隔，最多 4 个
   --interval MIN        更新刷新间隔 1～1440 分钟（与 --interval-seconds 互斥）
   --interval-seconds SEC 更新刷新间隔 50～86400 秒（整数）
   --utc-offset +HH:MM   更新时区偏移
@@ -84,6 +84,27 @@ function requireString(value: string | undefined, option: string): string {
   return value;
 }
 
+export const MAX_API_KEYS = 4;
+const MAX_API_KEY_LENGTH = 128;
+
+// 同一平台最多 4 个 key：可重复传入，也可用逗号或换行分隔；重复 key 去重。
+export function parseApiKeys(values: string[] | undefined, option: string): string[] {
+  if (values === undefined) return [];
+  const keys = values
+    .flatMap((value) => value.split(/[\n\r,]+/))
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  const unique = [...new Set(keys)];
+  if (unique.length === 0) throw new CliError(`${option} 不能为空`);
+  if (unique.length > MAX_API_KEYS) {
+    throw new CliError(`${option} 最多支持 ${MAX_API_KEYS} 个 key`);
+  }
+  if (unique.some((key) => key.length > MAX_API_KEY_LENGTH)) {
+    throw new CliError(`${option} 的单个 key 不能超过 ${MAX_API_KEY_LENGTH} 个字符`);
+  }
+  return unique;
+}
+
 function redactSensitiveText(text: string): string {
   return text
     .replace(
@@ -118,8 +139,8 @@ async function updateDevice(args: string[]): Promise<void> {
       port: { type: "string" },
       ssid: { type: "string" },
       password: { type: "string" },
-      "deepseek-key": { type: "string" },
-      "openrouter-key": { type: "string" },
+      "deepseek-key": { type: "string", multiple: true },
+      "openrouter-key": { type: "string", multiple: true },
       interval: { type: "string" },
       "interval-seconds": { type: "string" },
       "utc-offset": { type: "string" },
@@ -129,6 +150,13 @@ async function updateDevice(args: string[]): Promise<void> {
     cmd: "configure",
     ...parseRefreshInterval(values.interval, values["interval-seconds"]),
   };
+
+  // 两个平台可以独立更新；同一平台的多个 key 以换行分隔下放设备。
+  const deepseekKeys = parseApiKeys(values["deepseek-key"], "--deepseek-key");
+  const openrouterKeys = parseApiKeys(values["openrouter-key"], "--openrouter-key");
+  if (deepseekKeys.length > 0) payload.deepseek_key = deepseekKeys.join("\n");
+  if (openrouterKeys.length > 0) payload.openrouter_key = openrouterKeys.join("\n");
+
   const port = await resolvePort(values.port);
 
   // Wi-Fi：给了 --ssid 或 --password 才更新；改 SSID 而未给密码时交互补齐。
@@ -144,21 +172,6 @@ async function updateDevice(args: string[]): Promise<void> {
 
   if (values["utc-offset"] !== undefined) {
     payload.utc_offset_minutes = parseUtcOffset(values["utc-offset"]);
-  }
-
-  // 两个 key 成对更新：只给一个时交互补齐另一个。
-  if (values["deepseek-key"] !== undefined || values["openrouter-key"] !== undefined) {
-    const deepseekKey = (
-      values["deepseek-key"] ?? (await readHidden("DeepSeek API Key：", "--deepseek-key"))
-    ).trim();
-    const openrouterKey = (
-      values["openrouter-key"] ?? (await readHidden("OpenRouter API Key：", "--openrouter-key"))
-    ).trim();
-    if (!deepseekKey || !openrouterKey) {
-      throw new CliError("DeepSeek 和 OpenRouter 的 API Key 不能为空");
-    }
-    payload.deepseek_key = deepseekKey;
-    payload.openrouter_key = openrouterKey;
   }
 
   const updatedFields = Object.keys(payload).filter((key) => key !== "cmd");

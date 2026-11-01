@@ -12,6 +12,8 @@
 #include "quota_settings.h"
 #include "delta_format.h"
 #include "balance_protocol.h"
+#include "balance_format.h"
+#include "key_list.h"
 
 
 namespace pins {
@@ -86,8 +88,8 @@ struct Settings {
   String accessToken;
   String refreshToken;
   String accountId;
-  String deepseekKey;
-  String openrouterKey;
+  String deepseekKeys;
+  String openrouterKeys;
   uint64_t expiresAt = 0;
   uint32_t refreshSeconds = quota::kDefaultRefreshSeconds;
   int16_t utcOffsetMinutes = 0;
@@ -96,9 +98,9 @@ struct Settings {
     return !accessToken.isEmpty() && !refreshToken.isEmpty() && !accountId.isEmpty();
   }
 
-  bool deepseekConfigured() const { return !deepseekKey.isEmpty(); }
+  bool deepseekConfigured() const { return !deepseekKeys.isEmpty(); }
 
-  bool openrouterConfigured() const { return !openrouterKey.isEmpty(); }
+  bool openrouterConfigured() const { return !openrouterKeys.isEmpty(); }
 
   // 本版本只采集和显示 Claude；保留旧平台凭据但不再轮询旧数据源。
   bool credentialsPresent() const {
@@ -118,6 +120,21 @@ struct Settings {
   }
 };
 
+// 一个平台按配置顺序保存多个 key 的余额；某个 key 失败时保留它上次成功值。
+struct BalanceGroup {
+  balance_protocol::Balance values[key_list::kMaxKeys];
+  bool slotStale[key_list::kMaxKeys] = {};
+  size_t count = 0;
+  bool stale = false;
+
+  bool anyPresent() const {
+    for (size_t i = 0; i < count; ++i) {
+      if (values[i].present) return true;
+    }
+    return false;
+  }
+};
+
 using RateWindow = claude::RateWindow;
 
 struct Key {
@@ -131,10 +148,8 @@ struct Key {
 Settings settings;
 RateWindow fiveHour;
 RateWindow sevenDay;
-balance_protocol::Balance deepseekBalance;
-balance_protocol::Balance openrouterBalance;
-bool deepseekStale = false;
-bool openrouterStale = false;
+BalanceGroup deepseekBalances;
+BalanceGroup openrouterBalances;
 UiState uiState = UiState::kUnconfigured;
 String lastErrorDetail;
 Key keys[] = {
@@ -288,6 +303,14 @@ void loadClaudeAuth() {
   claudeBlockedUntil = preferences.getUInt("claude_wait", 0);
 }
 
+void resetBalanceGroup(BalanceGroup& group, const String& rawKeys) {
+  group = BalanceGroup{};
+  key_list::List keys;
+  if (key_list::parse(rawKeys.c_str(), rawKeys.length(), keys)) {
+    group.count = keys.count;
+  }
+}
+
 void loadSettings() {
   preferences.begin("codexquota", false);
   loadClaudeAuth();
@@ -296,12 +319,14 @@ void loadSettings() {
   settings.accessToken = preferences.getString("access");
   settings.refreshToken = preferences.getString("refresh");
   settings.accountId = preferences.getString("account");
-  settings.deepseekKey = preferences.getString("deepseek");
-  settings.openrouterKey = preferences.getString("openrouter");
+  settings.deepseekKeys = preferences.getString("deepseek");
+  settings.openrouterKeys = preferences.getString("openrouter");
   settings.expiresAt = preferences.getULong64("expires", 0);
   // Upgrade legacy minute-based settings to the new 5-minute default.
   settings.refreshSeconds = preferences.getUInt("period_s", quota::kDefaultRefreshSeconds);
   settings.utcOffsetMinutes = preferences.getShort("utc_off", 0);
+  resetBalanceGroup(deepseekBalances, settings.deepseekKeys);
+  resetBalanceGroup(openrouterBalances, settings.openrouterKeys);
 }
 
 bool saveSettings() {
@@ -319,13 +344,13 @@ bool saveSettings() {
   if (!settings.accessToken.isEmpty()) ok &= preferences.putString("access", settings.accessToken) > 0;
   if (!settings.refreshToken.isEmpty()) ok &= preferences.putString("refresh", settings.refreshToken) > 0;
   if (!settings.accountId.isEmpty()) ok &= preferences.putString("account", settings.accountId) > 0;
-  if (!settings.deepseekKey.isEmpty()) {
-    ok &= preferences.putString("deepseek", settings.deepseekKey) > 0;
+  if (!settings.deepseekKeys.isEmpty()) {
+    ok &= preferences.putString("deepseek", settings.deepseekKeys) > 0;
   } else {
     preferences.remove("deepseek");
   }
-  if (!settings.openrouterKey.isEmpty()) {
-    ok &= preferences.putString("openrouter", settings.openrouterKey) > 0;
+  if (!settings.openrouterKeys.isEmpty()) {
+    ok &= preferences.putString("openrouter", settings.openrouterKeys) > 0;
   } else {
     preferences.remove("openrouter");
   }
@@ -340,9 +365,8 @@ void clearSettings() {
   settings = Settings{};
   claudeAuth = ClaudeAuth{};
   claudeBlockedUntil = 0;
-  deepseekBalance = balance_protocol::Balance{};
-  openrouterBalance = balance_protocol::Balance{};
-  deepseekStale = openrouterStale = false;
+  deepseekBalances = BalanceGroup{};
+  openrouterBalances = BalanceGroup{};
   fiveHour = RateWindow{};
   sevenDay = RateWindow{};
   lastRefreshEpoch = 0;
@@ -606,16 +630,35 @@ bool refreshQuota() {
     if (!success && ok) { firstError = uiState; firstDetail = lastErrorDetail; }
     ok = ok && success;
   };
+  // 同一平台的多个 key 逐个请求：单个 key 失败只标记它自己，其余 key 继续更新。
+  auto refreshGroup = [&](const char* host, const char* url, const String& rawKeys,
+                          bool (*parse)(const char*, balance_protocol::Balance&),
+                          BalanceGroup& group) {
+    key_list::List keys;
+    if (!key_list::parse(rawKeys.c_str(), rawKeys.length(), keys)) {
+      setError(UiState::kDataError, String(host) + " 余额 key 配置无效");
+      group.count = 0;
+      group.stale = true;
+      record(false);
+      return;
+    }
+    group.count = keys.count;
+    group.stale = false;
+    for (size_t i = 0; i < keys.count; ++i) {
+      const bool refreshed = refreshBalance(host, url, keys.items[i], parse, group.values[i]);
+      group.slotStale[i] = !refreshed;
+      group.stale = group.stale || !refreshed;
+      record(refreshed);
+    }
+  };
   if (claudeAuth.configured()) record(refreshClaudeQuota());
   if (settings.deepseekConfigured()) {
-    deepseekStale = !refreshBalance("api.deepseek.com", "https://api.deepseek.com/user/balance",
-        settings.deepseekKey, balance_protocol::parseDeepSeek, deepseekBalance);
-    record(!deepseekStale);
+    refreshGroup("api.deepseek.com", "https://api.deepseek.com/user/balance",
+                 settings.deepseekKeys, balance_protocol::parseDeepSeek, deepseekBalances);
   }
   if (settings.openrouterConfigured()) {
-    openrouterStale = !refreshBalance("openrouter.ai", "https://openrouter.ai/api/v1/credits",
-        settings.openrouterKey, balance_protocol::parseOpenRouter, openrouterBalance);
-    record(!openrouterStale);
+    refreshGroup("openrouter.ai", "https://openrouter.ai/api/v1/credits",
+                 settings.openrouterKeys, balance_protocol::parseOpenRouter, openrouterBalances);
   }
   if (!ok) { setError(firstError, firstDetail); return false; }
   lastRefreshEpoch = epochNow();
@@ -732,24 +775,61 @@ String formatLastRefresh() {
   return String(elapsedSeconds / 60) + "m 前";
 }
 
-void drawBalanceLine(int16_t y, const char* label,
-                     const balance_protocol::Balance& balance, bool stale) {
-  display.setFont(u8g2_font_6x12_tf);
-  display.drawStr(0, y, label);
-  if (balance.present && stale) {
-    display.drawStr(display.getStrWidth(label) + 1, y, "*");
+void drawBalanceLine(int16_t y, const char* label, const BalanceGroup& group) {
+  char amount[96];
+  if (!balance_format::joined(group.values, group.count, amount, sizeof(amount))) {
+    std::snprintf(amount, sizeof(amount), "--");
   }
-  // Keep both decimal points aligned, even when only one balance is stale.
-  display.setFont(u8g2_font_7x14_tf);
-  const String amount = balance.present ? String(balance.remaining, 2) : "--";
-  display.drawStr(128 - display.getStrWidth(amount.c_str()), y, amount.c_str());
+  const bool stale = group.stale && group.anyPresent();
+  struct Layout {
+    const uint8_t* amountFont;
+    const uint8_t* labelFont;
+    bool showLabel;
+  };
+  // 两个 key 的金额与平台名仍可共用原来的 7×14/6×12；key 更多时逐级缩小，
+  // 极端情况下省略平台名，保证金额不被截断。
+  const Layout layouts[] = {
+      {u8g2_font_7x14_tf, u8g2_font_6x12_tf, true},
+      {u8g2_font_6x12_tf, u8g2_font_6x12_tf, true},
+      {u8g2_font_5x8_tf, u8g2_font_5x8_tf, true},
+      {u8g2_font_6x12_tf, u8g2_font_6x12_tf, false},
+      {u8g2_font_5x8_tf, u8g2_font_5x8_tf, false},
+  };
+  const Layout* chosen = &layouts[sizeof(layouts) / sizeof(layouts[0]) - 1];
+  int16_t labelWidth = 0;
+  int16_t amountWidth = 0;
+  for (const Layout& layout : layouts) {
+    display.setFont(layout.labelFont);
+    labelWidth = layout.showLabel ? display.getStrWidth(label) : 0;
+    const int16_t markerWidth = stale ? display.getStrWidth("*") : 0;
+    display.setFont(layout.amountFont);
+    amountWidth = display.getStrWidth(amount);
+    const int16_t marker = layout.showLabel ? labelWidth + markerWidth + 1 : markerWidth + 2;
+    const int16_t needed = marker + (layout.showLabel ? 2 : 0) + amountWidth;
+    if (needed <= 128) {
+      chosen = &layout;
+      break;
+    }
+  }
+  display.setFont(chosen->labelFont);
+  if (chosen->showLabel) {
+    display.drawStr(0, y, label);
+    labelWidth = display.getStrWidth(label);
+    if (stale) display.drawStr(labelWidth + 1, y, "*");
+  } else if (stale) {
+    display.drawStr(0, y, "*");
+  }
+  display.setFont(chosen->amountFont);
+  amountWidth = display.getStrWidth(amount);
+  const int16_t x = amountWidth < 128 ? 128 - amountWidth : 0;
+  display.drawStr(x, y, amount);
 }
 
 void drawScreen() {
   display.clearBuffer();
   drawWindowLine(14, sevenDay, true);
-  drawBalanceLine(30, "deepseek", deepseekBalance, deepseekStale);
-  drawBalanceLine(46, "openrouter", openrouterBalance, openrouterStale);
+  drawBalanceLine(30, "deepseek", deepseekBalances);
+  drawBalanceLine(46, "openrouter", openrouterBalances);
   const int16_t statusTop = 51;
 
   display.setFont(u8g2_font_6x12_tf);
@@ -808,9 +888,11 @@ void handleSerialCommand(const String& line) {
         cJSON_GetObjectItemCaseSensitive(root, "refresh_token") != nullptr ||
         cJSON_GetObjectItemCaseSensitive(root, "account_id") != nullptr ||
         expiresAt != nullptr;
-    const bool keyFieldsProvided =
-        cJSON_GetObjectItemCaseSensitive(root, "deepseek_key") != nullptr ||
+    const bool deepseekProvided =
+        cJSON_GetObjectItemCaseSensitive(root, "deepseek_key") != nullptr;
+    const bool openrouterProvided =
         cJSON_GetObjectItemCaseSensitive(root, "openrouter_key") != nullptr;
+    const bool keyFieldsProvided = deepseekProvided || openrouterProvided;
     const bool ssidProvided =
         cJSON_GetObjectItemCaseSensitive(root, "wifi_ssid") != nullptr;
     const bool passwordProvided =
@@ -842,10 +924,22 @@ void handleSerialCommand(const String& line) {
               !candidate.accountId.isEmpty();
     }
     if (keyFieldsProvided) {
-      valid = valid &&
-              jsonString(root, "deepseek_key", candidate.deepseekKey) &&
-              jsonString(root, "openrouter_key", candidate.openrouterKey) &&
-              !candidate.deepseekKey.isEmpty() && !candidate.openrouterKey.isEmpty();
+      // 两个平台可以独立更新；每个平台的 key 列表最多 key_list::kMaxKeys 个。
+      key_list::List keys;
+      if (deepseekProvided) {
+        valid = valid &&
+                jsonString(root, "deepseek_key", candidate.deepseekKeys) &&
+                key_list::parse(candidate.deepseekKeys.c_str(),
+                                candidate.deepseekKeys.length(), keys) &&
+                keys.count > 0;
+      }
+      if (openrouterProvided) {
+        valid = valid &&
+                jsonString(root, "openrouter_key", candidate.openrouterKeys) &&
+                key_list::parse(candidate.openrouterKeys.c_str(),
+                                candidate.openrouterKeys.length(), keys) &&
+                keys.count > 0;
+      }
     }
     if (valid) {
       if (utcOffset != nullptr) {
@@ -859,6 +953,12 @@ void handleSerialCommand(const String& line) {
         addResponseBase(response, requestId, true);
         cJSON_AddNumberToObject(response, "refresh_minutes", settings.refreshSeconds / 60.0);
         cJSON_AddNumberToObject(response, "refresh_seconds", settings.refreshSeconds);
+        if (deepseekProvided) {
+          resetBalanceGroup(deepseekBalances, settings.deepseekKeys);
+        }
+        if (openrouterProvided) {
+          resetBalanceGroup(openrouterBalances, settings.openrouterKeys);
+        }
         WiFi.disconnect(true, false);
         refreshRequested = true;
         nextRefreshAtMs = 0;
@@ -953,17 +1053,44 @@ void handleSerialCommand(const String& line) {
     };
     addWindow("five_hour", fiveHour);
     addWindow("seven_day", sevenDay);
-    auto addBalance = [&](const char* name, const balance_protocol::Balance& balance, bool stale) {
-      cJSON* value = cJSON_AddObjectToObject(response, name);
-      cJSON_AddBoolToObject(value, "present", balance.present);
-      cJSON_AddBoolToObject(value, "stale", stale);
-      if (balance.present) {
-        cJSON_AddNumberToObject(value, "remaining", balance.remaining);
-        cJSON_AddStringToObject(value, "currency", balance.currency);
+    auto addBalance = [&](const char* summaryName, const char* listName,
+                          const BalanceGroup& group) {
+      bool present = false;
+      bool stale = false;
+      double total = 0.0;
+      const char* currency = nullptr;
+      for (size_t i = 0; i < group.count; ++i) {
+        if (group.values[i].present) {
+          present = true;
+          total += group.values[i].remaining;
+          if (currency == nullptr) currency = group.values[i].currency;
+        }
+        stale = stale || group.slotStale[i];
+      }
+      // 汇总字段保留原有形状：remaining 为已取得余额的合计，count 为 key 数。
+      cJSON* summary = cJSON_AddObjectToObject(response, summaryName);
+      cJSON_AddBoolToObject(summary, "present", present);
+      cJSON_AddBoolToObject(summary, "stale", stale);
+      cJSON_AddNumberToObject(summary, "count", static_cast<double>(group.count));
+      if (present) {
+        cJSON_AddNumberToObject(summary, "remaining", total);
+        cJSON_AddStringToObject(summary, "currency", currency);
+      }
+      cJSON* entries = cJSON_AddArrayToObject(response, listName);
+      for (size_t i = 0; i < group.count; ++i) {
+        cJSON* entry = cJSON_CreateObject();
+        cJSON_AddNumberToObject(entry, "index", static_cast<double>(i));
+        cJSON_AddBoolToObject(entry, "present", group.values[i].present);
+        cJSON_AddBoolToObject(entry, "stale", group.slotStale[i]);
+        if (group.values[i].present) {
+          cJSON_AddNumberToObject(entry, "remaining", group.values[i].remaining);
+          cJSON_AddStringToObject(entry, "currency", group.values[i].currency);
+        }
+        cJSON_AddItemToArray(entries, entry);
       }
     };
-    addBalance("deepseek_balance", deepseekBalance, deepseekStale);
-    addBalance("openrouter_balance", openrouterBalance, openrouterStale);
+    addBalance("deepseek_balance", "deepseek_balances", deepseekBalances);
+    addBalance("openrouter_balance", "openrouter_balances", openrouterBalances);
     cJSON_AddBoolToObject(response, "configured", settings.configured());
     cJSON_AddBoolToObject(response, "codex_configured", settings.codexConfigured());
     cJSON_AddBoolToObject(response, "deepseek_configured", settings.deepseekConfigured());
@@ -981,8 +1108,12 @@ void handleSerialCommand(const String& line) {
     cJSON_AddNumberToObject(response, "wifi_rssi",
                             WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
     cJSON_AddStringToObject(response, "wifi_ip", WiFi.localIP().toString().c_str());
-    cJSON_AddBoolToObject(response, "deepseek_key_set", !settings.deepseekKey.isEmpty());
-    cJSON_AddBoolToObject(response, "openrouter_key_set", !settings.openrouterKey.isEmpty());
+    cJSON_AddBoolToObject(response, "deepseek_key_set", settings.deepseekConfigured());
+    cJSON_AddBoolToObject(response, "openrouter_key_set", settings.openrouterConfigured());
+    cJSON_AddNumberToObject(response, "deepseek_key_count",
+                            static_cast<double>(deepseekBalances.count));
+    cJSON_AddNumberToObject(response, "openrouter_key_count",
+                            static_cast<double>(openrouterBalances.count));
     cJSON_AddNumberToObject(response, "i2c_address", kDisplayI2cAddress);
     cJSON_AddNumberToObject(response, "scl_gpio9", digitalRead(pins::kI2cClock));
     cJSON_AddNumberToObject(response, "sda_gpio8", digitalRead(pins::kI2cData));

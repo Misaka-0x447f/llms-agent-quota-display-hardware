@@ -30,6 +30,8 @@ PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -e esp32c3_supermini -t
 串口为 115200 baud。固件使用 NVS 明文保存 Wi-Fi 和 Claude 凭据；当前阶段
 没有启用 ESP32 Flash Encryption。默认显示 Claude 7 天额度、DeepSeek 和
 OpenRouter 余额；Claude 凭据存入独立的 `claude_auth` NVS 值，不复用旧令牌。
+每个平台最多 4 个 API key，多个余额在屏幕上用 `+` 拼接，2 个及以上时每个
+金额保留一位小数；单个 key 仍保留两位小数。
 
 默认固件使用 `pnpm --dir cli codex-quota-device login --provider claude` 授权。
 
