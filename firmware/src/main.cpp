@@ -299,7 +299,7 @@ void loadSettings() {
   settings.deepseekKey = preferences.getString("deepseek");
   settings.openrouterKey = preferences.getString("openrouter");
   settings.expiresAt = preferences.getULong64("expires", 0);
-  // Upgrade legacy minute-based settings to the new 50-second default.
+  // Upgrade legacy minute-based settings to the new 5-minute default.
   settings.refreshSeconds = preferences.getUInt("period_s", quota::kDefaultRefreshSeconds);
   settings.utcOffsetMinutes = preferences.getShort("utc_off", 0);
 }

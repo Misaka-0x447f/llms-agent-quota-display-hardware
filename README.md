@@ -18,7 +18,7 @@ Claude 行左侧将重置倒计时和 Δ 组成一组，剩余百分比独立贴
 某个平台请求失败时保留其上次成功值，在平台名后加 `*`，仍继续请求其他平台。
 DeepSeek 只读取 CNY 人民币余额，缺失或无效时保留旧值并标记异常，不回退 USD；OpenRouter 显示
 账户 `total_credits - total_usage`，其 `/api/v1/credits` 接口要求 management key。
-默认刷新间隔仍为 50 秒，Δ 在 ±1 小时内仍按 5 分钟舍入。
+默认刷新间隔为 5 分钟（300 秒），Δ 在 ±1 小时内仍按 5 分钟舍入。
 
 ```bash
 PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -e esp32c3_supermini
@@ -77,18 +77,20 @@ Claude 的 5 小时窗口仍会被解析，并出现在 `list` 的 `five_hour` �
 pnpm --dir cli install
 pnpm --dir cli codex-quota-device update \
   --ssid '你的 Wi-Fi' \
-  --interval-seconds 50 \
+  --interval-seconds 300 \
   --utc-offset +08:00
 
 pnpm --dir cli codex-quota-device login --provider claude
 ```
 
 改 SSID 而不传 `--password` 时，CLI 会隐藏输入 Wi-Fi 密码。`update` 只更新
-指定参数，不触发 OAuth。默认刷新间隔为 50 秒（成功获取后等待 50 秒再次请求）。
-`--interval-seconds` 支持 50～86400 整数秒；旧 `--interval` 仍支持 1～1440
-整数分钟，两者不可同时指定。升级旧分钟制固件后，旧刷新间隔统一改为 50 秒，
-Wi-Fi 和凭据保留；后续设置的秒级间隔会跨重启保留。无效的秒级持久化间隔
-会停止刷新并显示“配置无效”，不会静默回退。
+指定参数，不触发 OAuth。固件默认刷新间隔为 5 分钟（300 秒），即成功获取后
+等待 300 秒再次请求。`--interval-seconds` 支持 50～86400 整数秒；旧
+`--interval` 仍支持 1～1440 整数分钟，两者不可同时指定。升级旧分钟制固件后，
+未保存过秒级间隔的设备统一改用 5 分钟默认值，Wi-Fi 和凭据保留；已经保存过
+间隔的设备会沿用原值（例如之前保存的 50 秒或 3 分钟），需要显式执行
+`update --interval-seconds 300`。后续设置的秒级间隔会跨重启保留。无效的秒级
+持久化间隔会停止刷新并显示“配置无效”，不会静默回退。
 
 请使用 `login --provider claude`。CLI 先检查设备
 是否支持 Claude，再发起独立的 PKCE OAuth 授权，不读取电脑上 Claude Code 的
@@ -108,7 +110,7 @@ Wi-Fi 和凭据保留；后续设置的秒级间隔会跨重启保留。无效�
 ```bash
 pnpm --dir cli codex-quota-device list
 pnpm --dir cli codex-quota-device fetchNow
-pnpm --dir cli codex-quota-device update --interval-seconds 50
+pnpm --dir cli codex-quota-device update --interval-seconds 300
 pnpm --dir cli codex-quota-device erase
 ```
 
@@ -118,8 +120,8 @@ pnpm --dir cli codex-quota-device erase
 `list` 返回 `usage_provider: "claude"`、是否已配置、是否需要登录、令牌过期
 时间、接口冷却截止时间和两档用量（屏幕只绘制 7 天），不返回凭据。注意串口中
 的 `used_percent` 是**已用**百分比，屏幕是**剩余**百分比；`reset_at` 是 Unix 秒。
-`refresh_seconds` 是配置的刷新间隔；兼容字段 `refresh_minutes` 为等值分钟数，
-50 秒时它为小数。
+`refresh_seconds` 是配置的刷新间隔；兼容字段 `refresh_minutes` 为等值分钟数
+（5 分钟默认值对应 5）。
 
 设备在抓取前检查访问令牌，距过期不足 120 秒时先续期；用量接口返回 401 时
 最多续期一次并重试。刷新间隔很长时，可在访问令牌已经过期后用刷新令牌续期。

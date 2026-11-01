@@ -29,11 +29,12 @@ void longer_deltas_keep_the_existing_duration_formatter() {
   TEST_ASSERT_EQUAL_STRING("same", output);
 }
 
-void interval_defaults_to_fifty_seconds_and_supports_legacy_minutes() {
-  TEST_ASSERT_EQUAL_UINT32(50, quota::kDefaultRefreshSeconds);
+void interval_defaults_to_five_minutes_and_supports_legacy_minutes() {
+  TEST_ASSERT_EQUAL_UINT32(300, quota::kDefaultRefreshSeconds);
   struct Example { const char* json; uint32_t seconds; };
   const Example examples[] = {
-    {"{}", 50}, {R"({"refresh_seconds":50})", 50},
+    {"{}", 300}, {R"({"refresh_seconds":50})", 50},
+    {R"({"refresh_seconds":300})", 300},
     {R"({"refresh_seconds":86400})", 86400},
     {R"({"refresh_minutes":1})", 60}, {R"({"refresh_minutes":1440})", 86400}
   };
@@ -72,7 +73,7 @@ int main() {
   UNITY_BEGIN();
   RUN_TEST(delta_rounds_to_five_minutes_with_symmetric_ties);
   RUN_TEST(longer_deltas_keep_the_existing_duration_formatter);
-  RUN_TEST(interval_defaults_to_fifty_seconds_and_supports_legacy_minutes);
+  RUN_TEST(interval_defaults_to_five_minutes_and_supports_legacy_minutes);
   RUN_TEST(invalid_or_ambiguous_intervals_preserve_the_previous_setting);
   return UNITY_END();
 }

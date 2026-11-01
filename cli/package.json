@@ -8,6 +8,7 @@
     "codex-quota-device": "src/cli.ts"
   },
   "scripts": {
+    "start": "node --import tsx src/cli.ts",
     "codex-quota-device": "node --import tsx src/cli.ts",
     "test": "node --import tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit",

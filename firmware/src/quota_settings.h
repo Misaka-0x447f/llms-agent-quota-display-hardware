@@ -4,7 +4,7 @@
 #include <cJSON.h>
 
 namespace quota {
-constexpr uint32_t kDefaultRefreshSeconds = 50;
+constexpr uint32_t kDefaultRefreshSeconds = 300;
 constexpr uint32_t kMinimumRefreshSeconds = 50;
 constexpr uint32_t kMaximumRefreshSeconds = 86400;
 
