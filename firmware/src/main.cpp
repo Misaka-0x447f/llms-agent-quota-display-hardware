@@ -786,11 +786,14 @@ void drawBalanceLine(int16_t y, const char* label, const BalanceGroup& group) {
     const uint8_t* labelFont;
     bool showLabel;
   };
-  // 两个 key 的金额与平台名仍可共用原来的 7×14/6×12；key 更多时逐级缩小，
-  // 极端情况下省略平台名，保证金额不被截断。
+  // 单个余额沿用原来的 6×12 平台名；显示 2 个及以上余额时改用更小的 5×8
+  // 平台名，把宽度让给 + 拼接的金额，金额仍优先保持 7×14。key 更多时继续
+  // 逐级缩小，极端情况下省略平台名。
+  const uint8_t* primaryLabelFont =
+      group.count >= 2 ? u8g2_font_5x8_tf : u8g2_font_6x12_tf;
   const Layout layouts[] = {
-      {u8g2_font_7x14_tf, u8g2_font_6x12_tf, true},
-      {u8g2_font_6x12_tf, u8g2_font_6x12_tf, true},
+      {u8g2_font_7x14_tf, primaryLabelFont, true},
+      {u8g2_font_6x12_tf, primaryLabelFont, true},
       {u8g2_font_5x8_tf, u8g2_font_5x8_tf, true},
       {u8g2_font_6x12_tf, u8g2_font_6x12_tf, false},
       {u8g2_font_5x8_tf, u8g2_font_5x8_tf, false},
