@@ -36,6 +36,9 @@ constexpr uint32_t kSerialBaud = 115200;
 constexpr uint32_t kI2cFrequency = 100000;
 constexpr uint32_t kDebounceMs = 25;
 constexpr uint32_t kIdleRedrawMs = 60000;
+// 1px 进度条的帧间隔。I²C 约 1.4 KB/s，靠「只刷变化的两端」把单帧压到十几字节，
+// 25 ms 一帧仍然留有充足余量；实际帧率由 I²C 花的时间决定。
+constexpr uint32_t kLoadingFrameMs = 25;
 constexpr uint32_t kMinimumValidEpoch = 1700000000UL;
 // 设备在中国大陆：优先国内可达的 NTP 源（LWIP 最多 3 个），
 // 不再使用在境内经常超时的 time.google.com。
@@ -155,6 +158,14 @@ uint32_t nextRedrawAtMs = 0;
 uint8_t drawnPhase = 0;
 bool refreshRequested = false;
 bool sntpStarted = false;
+// 哪几行正在抓取（bit0 Claude、bit1 DeepSeek、bit2 OpenRouter）。这是 loading
+// 动画唯一的开关：只在 refreshSources 里置位，函数返回时统一清零，所以「刷新
+// 循环从未启动」的配置不会留下一条永远转动的线。单字节写在单核上是原子的，
+// 读端在显示锁内读一次。
+volatile uint8_t fetchingMask = 0;
+constexpr uint8_t kFetchClaude = 1u << 0;
+constexpr uint8_t kFetchDeepseek = 1u << 1;
+constexpr uint8_t kFetchOpenrouter = 1u << 2;
 constexpr uint8_t kDisplayI2cAddress = 0x3c;
 
 uint32_t epochNow() {
@@ -303,7 +314,6 @@ void resetBalanceGroup(BalanceGroup& group, const String& rawKeys) {
   key_list::List keys;
   if (key_list::parse(rawKeys.c_str(), rawKeys.length(), keys) && keys.count > 0) {
     group.count = keys.count;
-    group.status.state = UiState::kLoading;
   }
 }
 
@@ -321,7 +331,6 @@ void loadSettings() {
   settings.utcOffsetMinutes = preferences.getShort("utc_off", 0);
   resetBalanceGroup(deepseekBalances, settings.deepseekKeys);
   resetBalanceGroup(openrouterBalances, settings.openrouterKeys);
-  if (claudeAuth.configured()) claudeSource.state = UiState::kLoading;
 }
 
 bool saveSettings() {
@@ -699,7 +708,16 @@ void syncOverallState() {
 
 void refreshSources(const DueSources& due) {
   if (!anyDue(due)) return;
+  // 函数返回时（含任何提前 return）统一收线；动画只认这一个标志。
+  struct FetchClearer {
+    ~FetchClearer() { fetchingMask = 0; }
+  } clearOnExit;
+  // 联网阶段先把本轮到期的行都点亮：WiFi 重连最长 15 秒，这段时间也该有进度线。
+  // 联网就绪后改成按来源逐个点亮，避免「还在排队却显示在抓取」。
+  fetchingMask = (due.claude ? kFetchClaude : 0) | (due.deepseek ? kFetchDeepseek : 0) |
+                 (due.openrouter ? kFetchOpenrouter : 0);
   if (!connectWiFi()) {
+    fetchingMask = 0;
     // 联网失败时，本轮到期的每一行都显示同一个网络错误。
     if (due.claude) sourceFailed(claudeSource, true, uiState, lastErrorDetail);
     if (due.deepseek) sourceFailed(deepseekBalances.status, false, uiState, lastErrorDetail);
@@ -707,16 +725,19 @@ void refreshSources(const DueSources& due) {
     return;
   }
   if (due.claude) {
+    fetchingMask = kFetchClaude;
     if (!refreshClaudeUsage()) {
       sourceFailed(claudeSource, true, uiState, lastErrorDetail);
     }
   }
   if (due.deepseek) {
+    fetchingMask = kFetchDeepseek;
     refreshBalanceGroup("api.deepseek.com", "https://api.deepseek.com/user/balance",
                         settings.deepseekKeys, balance_protocol::parseDeepSeek,
                         deepseekBalances);
   }
   if (due.openrouter) {
+    fetchingMask = kFetchOpenrouter;
     refreshBalanceGroup("openrouter.ai", "https://openrouter.ai/api/v1/credits",
                         settings.openrouterKeys, balance_protocol::parseOpenRouter,
                         openrouterBalances);
@@ -787,7 +808,14 @@ void drawUiText(int16_t x, int16_t top, const char* text) {
 }
 
 void drawWindowLine(int16_t y, const RateWindow& window, bool rightAlignPercent = false) {
-  if (!window.present) return;
+  // 没有数据时也占住这一行：留一片空白会让该行的 loading 线看起来属于下一行。
+  // 余额行的 `--` 就是这样处理的，这里保持一致。
+  if (!window.present) {
+    display.setFont(u8g2_font_7x14_tf);
+    display.drawStr(0, y, "[--]");
+    display.drawStr(128 - display.getStrWidth("--"), y, "--");
+    return;
+  }
   const uint32_t now = epochNow();
   const uint32_t remainSeconds = window.resetAt > now ? window.resetAt - now : 0;
   const float remaining = 100.0f - window.usedPercent;
@@ -938,10 +966,43 @@ void drawBalanceLine(int16_t y, const char* label, const BalanceGroup& group) {
 constexpr int16_t kRowClaudeY = 20;
 constexpr int16_t kRowDeepseekY = 36;
 constexpr int16_t kRowOpenrouterY = 52;
+// loading 线紧贴本行文字下方。上下界来自实际渲染：7×14 的 "[" 顶到基线 −11、
+// 6×12 的 "deepseek"/"openrouter" 里 p 伸到基线 +1，视图 2 的中文 12×12 顶到 −11。
+// 因此线放在基线 +2，正好压在本行 ink 之下、离下一行 ink 还有 2px，读起来属于本行。
+constexpr int16_t kTextMaxTopRows = 11;
+constexpr int16_t kTextMaxBottomRows = 1;
+constexpr int16_t kRowClaudeLineY = kRowClaudeY + 2;
+constexpr int16_t kRowDeepseekLineY = kRowDeepseekY + 2;
+constexpr int16_t kRowOpenrouterLineY = kRowOpenrouterY + 2;
+static_assert(kRowClaudeLineY > kRowClaudeY + kTextMaxBottomRows, "line overlaps row 1");
+static_assert(kRowClaudeLineY + 1 <= kRowDeepseekY - kTextMaxTopRows, "line overlaps row 2");
+static_assert(kRowDeepseekLineY > kRowDeepseekY + kTextMaxBottomRows, "line overlaps row 2");
+static_assert(kRowDeepseekLineY + 1 <= kRowOpenrouterY - kTextMaxTopRows, "line overlaps row 3");
+static_assert(kRowOpenrouterLineY > kRowOpenrouterY + kTextMaxBottomRows, "line overlaps row 3");
+static_assert(kRowOpenrouterLineY < 64, "loading line off screen");
+// 每条线落在独立的 8px 页里，动画刷新一次只发一页。
+static_assert(kRowClaudeLineY / 8 != kRowDeepseekLineY / 8, "loading lines share a page");
+static_assert(kRowDeepseekLineY / 8 != kRowOpenrouterLineY / 8, "loading lines share a page");
+
+// 屏幕与三行的对应关系集中在这里，绘制和动画任务共用，避免两份列表走样。
+constexpr int16_t kDisplayWidth = 128;
+struct RowSlot {
+  int16_t baselineY;
+  int16_t lineY;
+  uint8_t fetchBit;
+};
+constexpr RowSlot kRows[] = {
+    {kRowClaudeY, kRowClaudeLineY, kFetchClaude},
+    {kRowDeepseekY, kRowDeepseekLineY, kFetchDeepseek},
+    {kRowOpenrouterY, kRowOpenrouterLineY, kFetchOpenrouter},
+};
+constexpr size_t kRowCount = sizeof(kRows) / sizeof(kRows[0]);
+static_assert(kRowCount == 3, "three rows expected");
 
 void drawClaudeRow(int16_t y, uint8_t phase) {
-  if (quota::showStatusView(quota::abnormal(claudeSource.state), phase)) {
-    drawStatusRow(y, "Claude", false, claudeSource.lastOkMs, quota::kClaudeRefreshSeconds,
+  const bool hasData = sevenDay.present;
+  if (quota::showStatusView(quota::abnormal(claudeSource.state), hasData, phase)) {
+    drawStatusRow(y, "claude", false, claudeSource.lastOkMs, quota::kClaudeRefreshSeconds,
                   claudeSource.state);
     return;
   }
@@ -950,7 +1011,7 @@ void drawClaudeRow(int16_t y, uint8_t phase) {
 
 void drawBalanceRow(int16_t y, const char* label, const BalanceGroup& group, uint8_t phase) {
   const bool stale = group.stale && group.anyPresent();
-  if (quota::showStatusView(quota::abnormal(group.status.state), phase)) {
+  if (quota::showStatusView(quota::abnormal(group.status.state), group.anyPresent(), phase)) {
     drawStatusRow(y, label, stale, group.status.lastOkMs, quota::kBalanceRefreshSeconds,
                   group.status.state);
     return;
@@ -965,14 +1026,76 @@ bool anyRowAbnormal() {
          quota::abnormal(openrouterBalances.status.state);
 }
 
+// 先把三条 1px 线清空，再给 mask 里正在抓取的行画上高光；屏幕外的部分由 u8g2 裁掉。
+// 只由动画任务调用：整屏重画不再画线，避免「全屏画过、任务却不知道」的残影。
+void drawLoadingLines(uint32_t nowMs, uint8_t mask) {
+  const quota::LoadingBarSpan span = quota::loadingBarSpan(nowMs, kDisplayWidth);
+  display.setDrawColor(0);
+  for (const RowSlot& row : kRows) display.drawBox(0, row.lineY, kDisplayWidth, 1);
+  display.setDrawColor(1);
+  for (const RowSlot& row : kRows) {
+    if ((mask & row.fetchBit) != 0) {
+      display.drawBox(span.x, row.lineY, span.width, 1);
+    }
+  }
+}
+
+// 主循环和动画任务都会碰显示屏与 u8g2 缓冲，必须串行。
+SemaphoreHandle_t displayMutex = nullptr;
+// 整屏重画后线会被一起刷掉，动画任务下一帧必须整段补画一次（而不是只补两端）。
+// 写端和读端都在 displayMutex 里，所以不需要额外同步。
+bool loadingBarNeedsFullFlush = true;
+
 void drawScreen() {
+  if (displayMutex != nullptr) xSemaphoreTake(displayMutex, portMAX_DELAY);
   display.clearBuffer();
   const uint8_t phase = quota::viewPhase(millis());
   drawClaudeRow(kRowClaudeY, phase);
   drawBalanceRow(kRowDeepseekY, "deepseek", deepseekBalances, phase);
   drawBalanceRow(kRowOpenrouterY, "openrouter", openrouterBalances, phase);
   display.sendBuffer();
+  loadingBarNeedsFullFlush = true;
   drawnPhase = phase;
+  if (displayMutex != nullptr) xSemaphoreGive(displayMutex);
+}
+
+// 后台动画：请求是阻塞的，只有在独立任务里刷新这 1px 才会在等待期间继续移动。
+// 每帧只重发高光扫过的 tile 列，不动整屏。
+void loadingAnimationTask(void*) {
+  uint8_t paintedMask = 0;  // 屏幕上当前画着线的行；刚停止的行还要再刷一次擦掉
+  int16_t previousX = 0;
+  for (;;) {
+    const uint32_t now = millis();
+    // 先无锁看一眼要不要画：空闲时绝大多数轮次直接跳到延时，不去抢显示锁。
+    if (fetchingMask != 0 || paintedMask != 0) {
+      if (displayMutex != nullptr && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(40)) == pdTRUE) {
+        const uint8_t mask = fetchingMask;  // 锁内再读一次，避免判断和绘制看到不同状态
+        drawLoadingLines(now, mask);
+        const quota::LoadingBarSpan span = quota::loadingBarSpan(now, kDisplayWidth);
+        const uint8_t dirty = static_cast<uint8_t>(mask | paintedMask);
+        // 整段重画只在「刚起步 / 行数变了 / 整屏刚重画过」时用；其余帧只补两端。
+        const bool fullFlush = loadingBarNeedsFullFlush || dirty != paintedMask;
+        const quota::LoadingBarFlush flush =
+            fullFlush ? quota::loadingBarFlush(previousX, span.x, quota::kLoadingBarWidth,
+                                               kDisplayWidth)
+                      : quota::loadingBarFlushDiff(previousX, span.x, quota::kLoadingBarWidth,
+                                                   kDisplayWidth);
+        for (uint8_t s = 0; s < flush.count; ++s) {
+          for (size_t i = 0; i < kRowCount; ++i) {
+            if ((dirty & kRows[i].fetchBit) == 0) continue;
+            display.updateDisplayArea(flush.spans[s].tx,
+                                      static_cast<uint8_t>(kRows[i].lineY / 8),
+                                      flush.spans[s].tw, 1);
+          }
+        }
+        paintedMask = mask;
+        previousX = span.x;
+        loadingBarNeedsFullFlush = false;
+        xSemaphoreGive(displayMutex);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(kLoadingFrameMs));
+  }
 }
 
 void sendResponse(cJSON* response) {
@@ -1328,10 +1451,21 @@ void setup() {
   serialLine.reserve(12000);
   delay(500);
   for (auto& key : keys) pinMode(key.pin, INPUT_PULLUP);
+  displayMutex = xSemaphoreCreateMutex();
   display.setI2CAddress(kDisplayI2cAddress << 1);
   display.setBusClock(kI2cFrequency);
   display.begin();
   loadSettings();
+  // 动画和互斥锁都是可选增强：任何一个建不出来就退化成「没有 1px 动画、照常绘图」，
+  // 不要因为可选功能把整机拖进 panic 或静默半失效。
+  if (displayMutex == nullptr) {
+    Serial.println("ERROR display mutex");
+  } else if (xTaskCreatePinnedToCore(loadingAnimationTask, "loading-bar", 4096, nullptr, 1,
+                                     nullptr, 0) != pdPASS) {
+    Serial.println("ERROR loading task");
+    vSemaphoreDelete(displayMutex);
+    displayMutex = nullptr;
+  }
   uiState = settings.configured() ? UiState::kConnecting : UiState::kUnconfigured;
   drawScreen();
   Serial.printf("READY OLED=0x%02X SCL=%u SDA=%u\n",

@@ -90,9 +90,12 @@ inline uint8_t viewPhase(uint32_t nowMs) {
   return static_cast<uint8_t>(((nowMs / kViewHoldMs) & 1U) + 1U);
 }
 
-// 只有异常行在相位 2 切到视图 2；其余情况一律显示视图 1。
-inline bool showStatusView(bool hasError, uint8_t phase) {
-  return hasError && phase == 2;
+// 只有异常行才可能切到视图 2；其余情况一律显示视图 1。
+// 这一行还没有任何数据时（hasData 为 false）不存在可以轮换的视图 1：这时常驻
+// 视图 2，否则屏幕会在「空白」和「状态词」之间来回闪，看起来像故障。
+inline bool showStatusView(bool hasError, bool hasData, uint8_t phase) {
+  if (!hasError) return false;
+  return !hasData || phase == 2;
 }
 
 // 视图 2 的横向排版：状态词贴右，其余元素贴左，彼此不重叠也不越过整行宽度。
@@ -111,6 +114,99 @@ struct StatusLineLayout {
   int16_t ageX;
   int16_t stateX;
 };
+
+// 正在刷新时在该行下面画 1px 的 indeterminate 进度条（Material 风格）：
+// 一段固定宽度的高光从左侧外面扫到右侧外面，循环往复。只占 1px 高度。
+constexpr uint32_t kLoadingSweepMs = 2400;
+constexpr int16_t kLoadingBarWidth = 32;
+
+struct LoadingBarSpan {
+  int16_t x;
+  int16_t width;
+};
+
+inline LoadingBarSpan loadingBarSpan(uint32_t nowMs, int16_t screenWidth) {
+  const int16_t travel = static_cast<int16_t>(screenWidth + kLoadingBarWidth);
+  const int32_t offset =
+      static_cast<int32_t>((nowMs % kLoadingSweepMs) * travel / kLoadingSweepMs);
+  LoadingBarSpan span{};
+  span.x = static_cast<int16_t>(offset - kLoadingBarWidth);
+  span.width = kLoadingBarWidth;
+  return span;
+}
+
+// 一页 128 字节在软件 I²C 上要 ~110 ms，所以只重发高光扫过的那几列 tile。
+// 新旧位置不相交时分成两段，避免扫到最右回卷那一帧退化成整页。
+constexpr uint8_t kLoadingMaxFlushes = 2;
+
+struct LoadingBarTiles {
+  uint8_t tx;
+  uint8_t tw;
+};
+
+struct LoadingBarFlush {
+  uint8_t count;
+  LoadingBarTiles spans[kLoadingMaxFlushes];
+};
+
+// 把像素区间 [left, right) 换算成 tile 区间；完全在屏幕外时返回 false。
+inline bool loadingBarTilesForRange(int16_t left, int16_t right, int16_t screenWidth,
+                                    LoadingBarTiles& tiles) {
+  if (left < 0) left = 0;
+  if (right > screenWidth) right = screenWidth;
+  if (right <= left) return false;
+  tiles.tx = static_cast<uint8_t>(left / 8);
+  tiles.tw = static_cast<uint8_t>((right - 1) / 8 - tiles.tx + 1);
+  return true;
+}
+
+inline bool loadingBarSpanToTiles(int16_t from, int16_t barWidth, int16_t screenWidth,
+                                  LoadingBarTiles& tiles) {
+  return loadingBarTilesForRange(from, static_cast<int16_t>(from + barWidth), screenWidth,
+                                 tiles);
+}
+
+// 整段重画：覆盖新旧高光的并集。起步、状态切换后用这一种。
+inline LoadingBarFlush loadingBarFlush(int16_t previousX, int16_t currentX, int16_t barWidth,
+                                       int16_t screenWidth) {
+  LoadingBarFlush flush{};
+  const int16_t left = previousX < currentX ? previousX : currentX;
+  const int16_t right =
+      static_cast<int16_t>((previousX > currentX ? previousX : currentX) + barWidth);
+  LoadingBarTiles tiles{};
+  if (loadingBarTilesForRange(left, right, screenWidth, tiles)) {
+    flush.count = 1;
+    flush.spans[0] = tiles;
+  }
+  return flush;
+}
+
+// 增量重画：只发两端变化的部分（高光是一段实心条，中间每帧都没变）。
+// 两块相交时是「一端擦掉、一端补上」；完全不相交（回卷或跳变）时是
+// 「旧位置擦掉、新位置画上」，各一两个 tile，不会退化成整页。
+inline LoadingBarFlush loadingBarFlushDiff(int16_t previousX, int16_t currentX, int16_t barWidth,
+                                           int16_t screenWidth) {
+  LoadingBarFlush flush{};
+  const int16_t previousRight = static_cast<int16_t>(previousX + barWidth);
+  const int16_t currentRight = static_cast<int16_t>(currentX + barWidth);
+  LoadingBarTiles tiles{};
+  const auto addSpan = [&](int16_t left, int16_t right) {
+    if (loadingBarTilesForRange(left, right, screenWidth, tiles)) {
+      flush.spans[flush.count++] = tiles;
+    }
+  };
+  if (currentX >= previousX && currentX < previousRight) {
+    addSpan(previousX, currentX);   // 左端露出的旧像素
+    addSpan(previousRight, currentRight);  // 右端新增的高光
+  } else if (currentX < previousX && currentRight > previousX) {
+    addSpan(currentX, previousX);   // 左端新增的高光
+    addSpan(currentRight, previousRight);  // 右端露出的旧像素
+  } else {
+    addSpan(previousX, previousRight);  // 不相交：擦旧
+    addSpan(currentX, currentRight);    // 画新
+  }
+  return flush;
+}
 
 inline StatusLineLayout statusLineLayout(int16_t width, int16_t stateWidth,
                                          int16_t labelWidth, int16_t ageWidth,

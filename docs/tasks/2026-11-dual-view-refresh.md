@@ -68,6 +68,107 @@
 - 视图 2 没有「当前是第几个视图」的角标：右上角放不下且会压住第一行。
 - `period_s` 旧值仍留在 NVS，不再读写；不主动清除。
 
+## 追加需求：1px loading 动画（用户新提出）
+
+- 需求：哪一行正在抓取，就在该行下面画一条 1px 的 Material 风格 indeterminate
+  进度条，只占 1px。
+- 取舍（用户选择）：请求期间主循环是阻塞的，动画必须放在独立任务里才动得起来；
+  用户接受新增一把显示互斥锁和并发逻辑。
+- 实现：
+  - `row_view.h::loadingBarSpan`（高光位置）与 `loadingBarFlush`（只算需要重发的
+    tile 列，新旧位置不相交时拆两段）都是纯函数，配 4 条原生测试。
+  - 线在行基线 **+2**（22/38/54），分属 2/4/6 三页；`static_assert` 用实测的
+    「最大上伸 11 行、最大下伸 1 行」锁住「不压本行、不压下一行、不出屏、不同页」。
+  - 字体上下界用主机端编译 u8g2 实际渲染量出：`[` 顶到基线 −11，7×14 的
+    `D-4h`/`27%` 为 −10..−1，6×12 的 `deepseek`/`openrouter` 因 `p` 到 +1。
+    所以 +2 紧贴本行、离下一行 ink 还有 2px；+3 会两边各差 1px，反而像属于下一行。
+  - loading 动画的开关是独立的 `fetchingMask`（bit0/1/2），只在 `refreshSources`
+    里置位、用 RAII 在函数返回时清零；`loadSettings`/`resetBalanceGroup` 不再写
+    `kLoading`。这样「刷新循环从未启动」的配置（有 Claude 凭据但没配 Wi-Fi、
+    或只配了余额 key）不会留下一条永久转动的线。
+  - `drawScreen` 不再画 loading 线，线只由动画任务画/擦，避免「全屏画过但任务
+    的 previousX 不知道」造成 boot 残影。
+  - `loadingAnimationTask` 每 60 ms 一帧，锁内读一次 `fetchingMask`；每帧只
+    `updateDisplayArea` 高光新旧位置覆盖的几列；`displayMutex` 串行化所有显示访问，
+    互斥锁或任务创建失败时打印错误并退化为「无动画、照常绘图」。
+  - 来源在发起请求前先置 `kLoading`（不算异常，不触发视图 2），抓完立刻覆盖。
+- 实测（串口临时埋点，验证后已移除）：软件 I²C 约 1.4 KB/s（一整页 128 B ≈ 90 ms、
+  整屏 ≈ 0.9 s）。按 tile 列刷新后的帧成本（含埋点自身约 4 ms/帧的串口开销）：
+
+  请求阻塞期间动画帧连续推进（`REQ` → 收线帧之间没有断档），`fetchingMask`
+  也从「联网阶段 7」逐个切到单来源位。
+
+- 帧率优化（用户反馈「帧数很低」后）：原实现每帧把整段 32px 高光重发，改成
+  「只刷变化的两端」（`loadingBarFlushDiff`）并把帧间隔 60 ms → 25 ms；
+  整段重画只在起步、行数变化、整屏重画之后做一次（`loadingBarNeedsFullFlush`）。
+
+  | 场景 | 优化前 | 优化后 |
+  | --- | --- | --- |
+  | 单来源 OpenRouter | 11.1 fps / 35 B | 21.5～26.5 fps / 15～16 B |
+  | 单来源 Claude | — | 22.1 fps / 16 B |
+  | 单来源 DeepSeek | 10.4 fps / 41 B | 17.4 fps / 23 B |
+
+  三行同时抓取时按 3 倍字节估算约 16 fps（未单独采样：WiFi 已连接时批次会
+  瞬间从「全部到期」切到单来源，三行同时在刷新的窗口太短）。
+- 上机：烧录后 OpenRouter 首次抓取出现一次 `TLS PADLOCK - Input data should be
+  aligned`，下一次 50 秒重试即恢复（`age_seconds` 归零），之后多轮抓取正常。
+  该现象只在单次出现，未做「临时关掉动画任务」的对照实验，因此**因果未证实**：
+  既可能是站点偶发 TLS 失败，也可能是动画任务分走 CPU 的副作用，待复现时再查。
+
+### 追加需求的第 1 轮审查（同模型 subagent：deepseek-official/deepseek-flash）
+
+| # | 意见 | 处置 |
+| --- | --- | --- |
+| 🔴1 | 「刷新循环从不启动」的配置（有 Claude 凭据但没配 Wi-Fi，或只配余额 key）会让 `loadSettings` 置的 `kLoading` 永久转动 | **属实，已修**。动画开关改成独立的 `fetchingMask`，只在 `refreshSources` 里置位、用 RAII 在函数返回时清零；`loadSettings`/`resetBalanceGroup` 不再写 `kLoading`。 |
+| 🟡1 | `drawScreen` 也画线，但动画任务的 `previousX` 不知道，boot 慢发送可能留残影 | **属实，已修**。线只由动画任务画/擦；整屏重画不再画线，也就没有「全屏画过而任务不知道」的耦合。 |
+| 🟡2 | `static_assert` 用了 ascent 10，但实际最大上伸是 11，断言锁不住「不压下一行」 | **属实，已修**。主机端渲染实测：`[` 顶到 −11、`p` 到 +1；改成 `kTextMaxTopRows=11`/`kTextMaxBottomRows=1`，线改到基线 +2（+3 会两边各差 1px，反而像属于下一行）。 |
+| 🟡3 | 互斥锁/任务创建失败未处理，`xSemaphoreTake(nullptr)` 会 panic | **属实，已修**。两处创建失败都打印 `ERROR ...` 并降级为「无动画、照常绘图」；所有 take/give 都有 null 保护。 |
+| 🟡4 | 动画任务在锁外读 `state`，同一帧读两次可能不一致 | **属实，已修**。改为锁内读一次 `fetchingMask`（单字节 volatile，写端只有 loopTask）。 |
+| 🟡5 | 只刷差集可再省 3 倍 I²C | **不采纳（记录理由）**。去掉「整屏画线」后，并集刷新是自洽的：任何时刻只靠 `previousX` 就能同时擦旧画新。改成差集必须在每次整屏重画后额外强制刷全段，正好是 🟡1 那类耦合。当前单来源 35～41 B/帧、8.7～11 fps 已够用。 |
+| 🟡6 | `anyRowLoading` 死代码、三行列表重复、魔法数 | **已修**。删除死函数；新增 `RowSlot kRows[]` 表 + `kDisplayWidth`/`kRowCount`，绘制与任务共用。 |
+| 🟡7 | 回卷用例断言太弱、注释过期、tracker 无测试 | **部分已修**。注释改为 32px/2.4 秒；回卷用例改成断言具体 tile（15@1 与 0@1）并补「部分出屏/完全出屏」用例。tracker（`painted`/`previousX`）仍在任务里，未抽成可测结构，作为已知缺口保留。 |
+| 🟡8 | 文档与实现/实测不一致 | **已修**。字体理由改成实测值；帧率表换成复测数据；README「单线程」改为「抓取串行、动画独立」；「屏幕不使用进度条」改为只指额度条；PADLOCK 结论改为「因果未证实」。 |
+
+### 追加需求的上机观察（2026-11-11 23:5x）
+
+- 动画固件跑通后（三行全绿、10.4/11.1 fps）出现过一段设备侧网络抖动：先后报
+  `DNS失败：openrouter.ai` 与 `connection refused`（Claude/DeepSeek），期间串口
+  `list` 有一次 20 秒无响应。主机侧同一时刻对三个接口均可达（HTTP 401），因此判断是
+  设备侧 WiFi/网络瞬断，与本改动无关（同一动画固件在抖动前刚验证过三行全绿）。
+- 由此暴露一个既有问题（非本次引入）：设备在网络故障时会在 `connectWiFi`（≤15 s）
+  与各来源的 HTTP 超时里阻塞，单次可达数十秒，期间串口命令不被处理，`list` 会超时。
+  记录为已知限制，本次不改。
+
+### 追加需求的第 2 轮审查（Claude 系列 subagent：subagent_claude_code）
+
+结论：**无严重问题**。处置：
+
+| # | 意见 | 处置 |
+| --- | --- | --- |
+| 1 | 字体边界「实测」只给了结论，没有可复跑的产物，`p` 是否到 +1 无法独立核实 | **已补证据链**。新增 `firmware/scripts/font_ink_probe.c`（离线渲染实际字体、回读 ink 行范围，带运行方法），输出记录在此：`[6d]` → −11..+1、`deepseek`/`openrouter` → −7..+1、`12.34` → −10..0。故 `kTextMaxTopRows=11`、`kTextMaxBottomRows=1` 成立，线在 +2 不压字。 |
+| 2 | `firmware/README` 写「整屏重画只在状态变化时发生」，但 `loop()` 每次到期刷新后都无条件 `drawScreen()` | **属实，已修文档**。改为「整屏重画沿用既有节奏（每次到期刷新后都做一次，不论数值是否变化），动画只在两次之间补实时反馈」。 |
+| 3 | 完全空闲时动画任务仍每 60 ms 抢一次显示锁 | **属实，已修**。先无锁判断 `fetchingMask/paintedMask`，空闲时直接延时；锁内再读一次状态。 |
+| 4 | 任务创建失败时创建出来的互斥锁不会被释放 | **属实，已修**。失败分支 `vSemaphoreDelete` 并置空，统一走「没有锁就不锁」的降级路径。 |
+| 5 | 「联网阶段点亮所有 due 行」与 README「只有真正发起抓取的行才有线」不一致 | **属实，已修文档**。README 写明 WiFi 重连阶段（最长 15 s）本轮到期的行都会亮线，联网成功后切成只点亮正在请求的那一行。 |
+
+### 用户上机反馈与追加修正（2026-11-12 00:0x）
+
+- 「loading 跑到 deepseek 去了」：**不是缺陷**。当时 Claude 行处于 `TCP被拒绝` 的 10 分钟退避里，屏幕上那条线是 DeepSeek 自己每 50 秒的抓取，位置正确。
+- 「claude 那行一闪一闪的」：**属实，是设计缺陷**。该行当时没有任何数据，视图 1 是空白，于是每 4 秒在「空白」与「状态词」之间切换，看起来像故障。
+  - 修法：`showStatusView(hasError, hasData, phase)` —— 出错但还没有数据的行常驻视图 2，不再轮换；有数据后才恢复 4 秒轮换。补 `dataless_error_row_never_blinks` 用例。
+  - 顺带：没有数据时视图 1 不再整行空白，Claude 行显示 `[--] ... --` 占位，与余额行的 `--` 一致。
+- 「c 小写」：视图 2 的 Claude 行平台名改为 `claude`，与 `deepseek` / `openrouter` 一致。
+
+### 追加需求：帧率优化（用户反馈后）
+
+- 改动：`row_view.h` 新增 `loadingBarFlushDiff`（只算新旧高光的对称差，即两端）；
+  `main.cpp` 增加 `loadingBarNeedsFullFlush`（整屏重画/起步/行数变化时整段补一次），
+  帧间隔 60 → 25 ms。补 `loading_bar_diff_only_flushes_the_changed_edges` 与
+  `loading_bar_full_flush_covers_both_positions` 两条用例。
+- 正确性要点：增量刷新只发对称差覆盖的 tile，中间没变的像素保持不动；回卷或
+  大跳变时退化成「擦旧 + 画新」两段，仍不会整页重发。
+- 实测见上表；本次改动发生在第 2 轮审查之后，只有单元测试与上机核对，未再单独开审查轮。
+
 ## 审查与验证记录
 
 ### 构建与测试（2026-11-11 22:2x）
