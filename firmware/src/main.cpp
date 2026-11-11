@@ -5,11 +5,14 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <cJSON.h>
+#include <esp_sntp.h>
 #include <time.h>
 
 #include "ui_glyphs.h"
 #include "claude_protocol.h"
-#include "quota_settings.h"
+#include "freshness_format.h"
+#include "refresh_plan.h"
+#include "row_view.h"
 #include "delta_format.h"
 #include "balance_protocol.h"
 #include "balance_format.h"
@@ -26,11 +29,19 @@ constexpr uint8_t kKeyUp = 0;
 }  // namespace pins
 
 namespace {
+using quota::uiMessage;
+using quota::UiState;
+
 constexpr uint32_t kSerialBaud = 115200;
 constexpr uint32_t kI2cFrequency = 100000;
 constexpr uint32_t kDebounceMs = 25;
 constexpr uint32_t kIdleRedrawMs = 60000;
 constexpr uint32_t kMinimumValidEpoch = 1700000000UL;
+// 设备在中国大陆：优先国内可达的 NTP 源（LWIP 最多 3 个），
+// 不再使用在境内经常超时的 time.google.com。
+constexpr char kNtpServer0[] = "ntp.aliyun.com";
+constexpr char kNtpServer1[] = "ntp1.aliyun.com";
+constexpr char kNtpServer2[] = "time.tencent.com";
 constexpr uint32_t kInitialRetryDelaySeconds = 30;
 constexpr uint32_t kMaximumRetryDelaySeconds = 15 * 60;
 constexpr size_t kMaximumSerialCommandBytes = 64 * 1024;
@@ -58,30 +69,6 @@ U8G2_SSD1315_128X64_NONAME_F_SW_I2C display(
     U8G2_R0, pins::kI2cClock, pins::kI2cData, U8X8_PIN_NONE);
 Preferences preferences;
 
-enum class UiState : uint8_t {
-  kUnconfigured,
-  kConfigError,
-  kConnecting,
-  kLoading,
-  kReady,
-  kWifiNoNetwork,
-  kWifiConnectionFailed,
-  kWifiTimeout,
-  kWifiDisconnected,
-  kTimeSyncError,
-  kDnsError,
-  kTlsError,
-  kTcpRefused,
-  kRequestTimeout,
-  kConnectionLost,
-  kTransportError,
-  kAuthError,
-  kRateLimitError,
-  kServerError,
-  kHttpError,
-  kDataError,
-};
-
 struct Settings {
   String wifiSsid;
   String wifiPassword;
@@ -91,7 +78,6 @@ struct Settings {
   String deepseekKeys;
   String openrouterKeys;
   uint64_t expiresAt = 0;
-  uint32_t refreshSeconds = quota::kDefaultRefreshSeconds;
   int16_t utcOffsetMinutes = 0;
 
   bool codexConfigured() const {
@@ -107,21 +93,22 @@ struct Settings {
     return !wifiSsid.isEmpty() && claudeAuth.configured();
   }
 
-  bool refreshIntervalValid() const {
-    return quota::validRefreshSeconds(refreshSeconds);
-  }
+  bool configured() const { return credentialsPresent(); }
+};
 
-  bool configured() const {
-    return credentialsPresent() && refreshIntervalValid();
-  }
-
-  bool configurationInvalid() const {
-    return credentialsPresent() && !refreshIntervalValid();
-  }
+// 每个来源（Claude 用量、每个平台的余额）各自记录显示状态、数据新鲜度和排队时刻。
+// 三个来源互不影响：一个失败不会拖住另一个的节奏，也不会共用一条错误信息。
+struct SourceStatus {
+  UiState state = UiState::kUnconfigured;
+  String detail;
+  uint32_t lastOkMs = 0;  // 最近一次成功获取的 millis()，0 表示还没有数据
+  uint32_t dueAtMs = 0;   // 下一次自动刷新的时刻，0 表示不在队列里
+  uint32_t retryDelaySeconds = kInitialRetryDelaySeconds;
 };
 
 // 一个平台按配置顺序保存多个 key 的余额；某个 key 失败时保留它上次成功值。
 struct BalanceGroup {
+  SourceStatus status;
   balance_protocol::Balance values[key_list::kMaxKeys];
   bool slotStale[key_list::kMaxKeys] = {};
   size_t count = 0;
@@ -148,6 +135,7 @@ struct Key {
 Settings settings;
 RateWindow fiveHour;
 RateWindow sevenDay;
+SourceStatus claudeSource;
 BalanceGroup deepseekBalances;
 BalanceGroup openrouterBalances;
 UiState uiState = UiState::kUnconfigured;
@@ -163,10 +151,10 @@ String lastMutationId;
 String lastMutationCommand;
 String lastMutationReply;
 uint32_t lastRefreshEpoch = 0;
-uint32_t nextRefreshAtMs = 0;
 uint32_t nextRedrawAtMs = 0;
-uint32_t retryDelaySeconds = kInitialRetryDelaySeconds;
+uint8_t drawnPhase = 0;
 bool refreshRequested = false;
+bool sntpStarted = false;
 constexpr uint8_t kDisplayI2cAddress = 0x3c;
 
 uint32_t epochNow() {
@@ -176,47 +164,54 @@ uint32_t epochNow() {
              : 0;
 }
 
-const char* uiMessage(UiState state) {
-  switch (state) {
-    case UiState::kUnconfigured: return "未配置";
-    case UiState::kConfigError: return "配置无效";
-    case UiState::kConnecting: return "正在联网";
-    case UiState::kLoading: return "正在刷新";
-    case UiState::kWifiNoNetwork: return "WiFi无此网络";
-    case UiState::kWifiConnectionFailed: return "WiFi连接失败";
-    case UiState::kWifiTimeout: return "WiFi连接超时";
-    case UiState::kWifiDisconnected: return "WiFi已断开";
-    case UiState::kTimeSyncError: return "时间同步失败";
-    case UiState::kDnsError: return "DNS失败";
-    case UiState::kTlsError: return "TLS失败";
-    case UiState::kTcpRefused: return "TCP被拒绝";
-    case UiState::kRequestTimeout: return "请求超时";
-    case UiState::kConnectionLost: return "连接已断开";
-    case UiState::kTransportError: return "HTTP传输失败";
-    case UiState::kAuthError: return "登录失效";
-    case UiState::kRateLimitError: return "请求过频";
-    case UiState::kServerError: return "服务器错误";
-    case UiState::kHttpError: return "HTTP错误";
-    case UiState::kDataError: return "数据异常";
-    case UiState::kReady: return "";
-  }
-  return "数据异常";
-}
-
 void setError(UiState state, const String& detail) {
   uiState = state;
   lastErrorDetail = detail;
 }
 
-void scheduleRetry() {
-  if (claudeAuth.pending) { nextRefreshAtMs = 0; return; }
-  uint32_t wait = retryDelaySeconds;
-  const uint32_t now = epochNow();
-  if (claudeBlockedUntil > now) wait = max(wait, claudeBlockedUntil - now);
-  // millis deadlines must remain within the signed 32-bit comparison range.
+// 成功：记下数据新鲜度，按该来源固定的间隔排下一次。
+void sourceSucceeded(SourceStatus& source, bool claude) {
+  source.state = UiState::kReady;
+  source.detail = "";
+  source.lastOkMs = millis();
+  source.retryDelaySeconds = kInitialRetryDelaySeconds;
+  source.dueAtMs = millis() + quota::refreshIntervalSeconds(claude) * 1000UL;
+  lastRefreshEpoch = epochNow();
+}
+
+// 失败：按该来源自己的间隔做退避；Claude 还要尊重服务端的 Retry-After 冷却。
+void scheduleSourceRetry(SourceStatus& source, bool claude) {
+  if (claude && claudeAuth.pending) {
+    // 凭据已失效：不再自动重试，避免连续触发 token 轮换。
+    source.dueAtMs = 0;
+    return;
+  }
+  uint32_t wait = quota::retryDelay(claude, source.retryDelaySeconds);
+  if (claude) {
+    // 冷却截止时间是 Unix 时间；时钟未同步时不能拿它算等待（见 refresh_plan.h）。
+    const uint32_t now = epochNow();
+    wait = max(wait, quota::cooldownRemainingSeconds(now != 0, claudeBlockedUntil, now));
+  }
+  // millis 截止时间必须留在 32 位有符号比较范围内。
   wait = min(wait, static_cast<uint32_t>(7 * 86400));
-  nextRefreshAtMs = millis() + wait * 1000UL;
-  retryDelaySeconds = min(kMaximumRetryDelaySeconds, retryDelaySeconds * 2);
+  source.dueAtMs = millis() + wait * 1000UL;
+  source.retryDelaySeconds = min(kMaximumRetryDelaySeconds, source.retryDelaySeconds * 2);
+}
+
+// 把这一行的失败状态记下来并安排退避；状态与详情由调用方给，避免依赖全局。
+void sourceFailed(SourceStatus& source, bool claude, UiState state, const String& detail) {
+  source.state = state;
+  source.detail = detail;
+  scheduleSourceRetry(source, claude);
+}
+
+// 数据确实更新了、但这一行仍要显示失败（例如多 key 里只坏了一个）。
+// 调度完全复用成功路径，避免继承已经翻倍过的退避；展示状态再覆盖回异常。
+void sourcePartiallySucceeded(SourceStatus& source, bool claude, UiState state,
+                              const String& detail) {
+  sourceSucceeded(source, claude);
+  source.state = state;
+  source.detail = detail;
 }
 
 String wifiStatusDetail(wl_status_t status) {
@@ -306,8 +301,9 @@ void loadClaudeAuth() {
 void resetBalanceGroup(BalanceGroup& group, const String& rawKeys) {
   group = BalanceGroup{};
   key_list::List keys;
-  if (key_list::parse(rawKeys.c_str(), rawKeys.length(), keys)) {
+  if (key_list::parse(rawKeys.c_str(), rawKeys.length(), keys) && keys.count > 0) {
     group.count = keys.count;
+    group.status.state = UiState::kLoading;
   }
 }
 
@@ -322,11 +318,10 @@ void loadSettings() {
   settings.deepseekKeys = preferences.getString("deepseek");
   settings.openrouterKeys = preferences.getString("openrouter");
   settings.expiresAt = preferences.getULong64("expires", 0);
-  // Upgrade legacy minute-based settings to the new 5-minute default.
-  settings.refreshSeconds = preferences.getUInt("period_s", quota::kDefaultRefreshSeconds);
   settings.utcOffsetMinutes = preferences.getShort("utc_off", 0);
   resetBalanceGroup(deepseekBalances, settings.deepseekKeys);
   resetBalanceGroup(openrouterBalances, settings.openrouterKeys);
+  if (claudeAuth.configured()) claudeSource.state = UiState::kLoading;
 }
 
 bool saveSettings() {
@@ -355,7 +350,6 @@ bool saveSettings() {
     preferences.remove("openrouter");
   }
   ok &= preferences.putULong64("expires", settings.expiresAt) > 0;
-  ok &= preferences.putUInt("period_s", settings.refreshSeconds) > 0;
   ok &= preferences.putShort("utc_off", settings.utcOffsetMinutes) > 0;
   return ok;
 }
@@ -365,13 +359,12 @@ void clearSettings() {
   settings = Settings{};
   claudeAuth = ClaudeAuth{};
   claudeBlockedUntil = 0;
+  claudeSource = SourceStatus{};
   deepseekBalances = BalanceGroup{};
   openrouterBalances = BalanceGroup{};
   fiveHour = RateWindow{};
   sevenDay = RateWindow{};
   lastRefreshEpoch = 0;
-  nextRefreshAtMs = 0;
-  retryDelaySeconds = kInitialRetryDelaySeconds;
   refreshRequested = false;
   WiFi.disconnect(true, true);
   uiState = UiState::kUnconfigured;
@@ -395,6 +388,8 @@ String formEncode(const String& input) {
   }
   return output;
 }
+
+void ensureTimeSync();
 
 bool connectWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -420,17 +415,19 @@ bool connectWiFi() {
       return false;
     }
   }
-  if (epochNow() != 0) return true;
-  configTime(0, 0, "pool.ntp.org", "time.cloudflare.com", "time.google.com");
-  const uint32_t timeDeadline = millis() + 10000;
-  while (epochNow() == 0 && static_cast<int32_t>(millis() - timeDeadline) < 0) {
-    delay(100);
-  }
-  if (epochNow() == 0) {
-    setError(UiState::kTimeSyncError, "NTP 时间同步失败（未取得有效时间）");
-    return false;
-  }
+  ensureTimeSync();
   return true;
+}
+
+// SNTP 常驻轮询：只在尚未生效时启动一次，期间不阻塞；同步成功后由设备
+// 自身 RTC 走时。这里不再每轮调用 configTime，避免把刚同步好的结果重置掉。
+// 时间暂不可用不阻止抓取：按日期展示的内容等时钟就绪后自然恢复。
+void ensureTimeSync() {
+  if (epochNow() != 0) return;
+  if (sntpStarted) return;
+  sntpStarted = true;
+  configTime(0, 0, kNtpServer0, kNtpServer1, kNtpServer2);
+  sntp_set_sync_interval(3600 * 1000);  // 每小时校正一次走时漂移
 }
 
 bool jsonString(cJSON* object, const char* key, String& destination) {
@@ -441,6 +438,8 @@ bool jsonString(cJSON* object, const char* key, String& destination) {
 }
 
 void recordClaudeCooldown(HTTPClient& http, int status) {
+  // 冷却截止时间用 Unix 时间表示，时钟还没同步时记录下来没有意义。
+  if (epochNow() == 0) return;
   const String retryAfter = http.header("Retry-After");
   const uint32_t requested = claude::retryAfter(retryAfter.c_str(), epochNow());
   if (status != 429 && requested == 0) return;
@@ -543,14 +542,15 @@ int getClaudeUsage(String& response) {
   return status;
 }
 
-bool refreshClaudeQuota() {
+bool refreshClaudeUsage() {
   if (claudeAuth.pending) {
     setError(UiState::kAuthError, "Claude 凭据需要重新授权，请运行 login");
     return false;
   }
-  if (!connectWiFi()) return false;
   // Manual refresh and reboot must respect the same server cooldown.
-  if (claudeBlockedUntil > epochNow()) {
+  // 时钟未就绪时冷却截止时间不可解释，按没有冷却处理，否则冷启动会卡死。
+  const uint32_t nowEpoch = epochNow();
+  if (quota::cooldownActive(nowEpoch != 0, claudeBlockedUntil, nowEpoch)) {
     setError(UiState::kRateLimitError, "Claude 接口冷却中，请稍后重试");
     return false;
   }
@@ -580,11 +580,7 @@ bool refreshClaudeQuota() {
     setError(UiState::kDataError, "Claude 用量响应缺少有效的 5h/7d 数据");
     return false;
   }
-  lastRefreshEpoch = epochNow();
-  nextRefreshAtMs = millis() + settings.refreshSeconds * 1000UL;
-  retryDelaySeconds = kInitialRetryDelaySeconds;
-  uiState = UiState::kReady;
-  lastErrorDetail = "";
+  sourceSucceeded(claudeSource, true);
   return true;
 }
 
@@ -621,52 +617,110 @@ bool refreshBalance(const char* host, const char* url, const String& key,
   return true;
 }
 
-bool refreshQuota() {
-  if (!connectWiFi()) return false;
-  bool ok = true;
+// 同一平台的多个 key 逐个请求：单个 key 失败只标记它自己，其余 key 继续更新。
+// 行状态取第一个失败 key 的错误，视图 2 显示它；视图 1 保留 * 标记该行有陈旧值。
+void refreshBalanceGroup(const char* host, const char* url, const String& rawKeys,
+                         bool (*parse)(const char*, balance_protocol::Balance&),
+                         BalanceGroup& group) {
+  key_list::List keys;
+  if (!key_list::parse(rawKeys.c_str(), rawKeys.length(), keys)) {
+    setError(UiState::kDataError, String(host) + " 余额 key 配置无效");
+    group.count = 0;
+    group.stale = true;
+    sourceFailed(group.status, false, uiState, lastErrorDetail);
+    return;
+  }
+  group.count = keys.count;
+  group.stale = false;
+  size_t failedCount = 0;
   UiState firstError = UiState::kReady;
   String firstDetail;
-  auto record = [&](bool success) {
-    if (!success && ok) { firstError = uiState; firstDetail = lastErrorDetail; }
-    ok = ok && success;
-  };
-  // 同一平台的多个 key 逐个请求：单个 key 失败只标记它自己，其余 key 继续更新。
-  auto refreshGroup = [&](const char* host, const char* url, const String& rawKeys,
-                          bool (*parse)(const char*, balance_protocol::Balance&),
-                          BalanceGroup& group) {
-    key_list::List keys;
-    if (!key_list::parse(rawKeys.c_str(), rawKeys.length(), keys)) {
-      setError(UiState::kDataError, String(host) + " 余额 key 配置无效");
-      group.count = 0;
-      group.stale = true;
-      record(false);
+  for (size_t i = 0; i < keys.count; ++i) {
+    const bool refreshed = refreshBalance(host, url, keys.items[i], parse, group.values[i]);
+    group.slotStale[i] = !refreshed;
+    group.stale = group.stale || !refreshed;
+    if (refreshed) continue;
+    if (failedCount == 0) {
+      firstError = uiState;
+      firstDetail = lastErrorDetail;
+    }
+    ++failedCount;
+  }
+  const quota::GroupDecision decision = quota::groupDecision(keys.count, failedCount);
+  if (!decision.showError) {
+    sourceSucceeded(group.status, false);
+    return;
+  }
+  // 部分 key 失败时错的那个由视图 1 的 * 标记、视图 2 显示它的状态，
+  // 但这一行仍按 50 秒节奏继续抓，健康 key 的数据不能被一个坏 key 拖旧。
+  if (decision.keepsSchedule) {
+    sourcePartiallySucceeded(group.status, false, firstError, firstDetail);
+    return;
+  }
+  sourceFailed(group.status, false, firstError, firstDetail);
+}
+
+// 三个来源各自排队，只刷新到期的那些；手动刷新时全部一起尝试。
+struct DueSources {
+  bool claude;
+  bool deepseek;
+  bool openrouter;
+};
+
+DueSources dueSources(bool manual, uint32_t nowMs) {
+  DueSources due{};
+  due.claude = claudeAuth.configured() &&
+               (manual || quota::refreshDue(nowMs, claudeSource.dueAtMs));
+  due.deepseek = settings.deepseekConfigured() &&
+                 (manual || quota::refreshDue(nowMs, deepseekBalances.status.dueAtMs));
+  due.openrouter = settings.openrouterConfigured() &&
+                   (manual || quota::refreshDue(nowMs, openrouterBalances.status.dueAtMs));
+  return due;
+}
+
+bool anyDue(const DueSources& due) {
+  return due.claude || due.deepseek || due.openrouter;
+}
+
+// 全局状态只服务于既有串口语义：取第一个异常行，没有异常就是 kReady。
+void syncOverallState() {
+  const SourceStatus* rows[] = {
+      &claudeSource, &deepseekBalances.status, &openrouterBalances.status};
+  for (const SourceStatus* row : rows) {
+    if (quota::abnormal(row->state)) {
+      uiState = row->state;
+      lastErrorDetail = row->detail;
       return;
     }
-    group.count = keys.count;
-    group.stale = false;
-    for (size_t i = 0; i < keys.count; ++i) {
-      const bool refreshed = refreshBalance(host, url, keys.items[i], parse, group.values[i]);
-      group.slotStale[i] = !refreshed;
-      group.stale = group.stale || !refreshed;
-      record(refreshed);
-    }
-  };
-  if (claudeAuth.configured()) record(refreshClaudeQuota());
-  if (settings.deepseekConfigured()) {
-    refreshGroup("api.deepseek.com", "https://api.deepseek.com/user/balance",
-                 settings.deepseekKeys, balance_protocol::parseDeepSeek, deepseekBalances);
   }
-  if (settings.openrouterConfigured()) {
-    refreshGroup("openrouter.ai", "https://openrouter.ai/api/v1/credits",
-                 settings.openrouterKeys, balance_protocol::parseOpenRouter, openrouterBalances);
-  }
-  if (!ok) { setError(firstError, firstDetail); return false; }
-  lastRefreshEpoch = epochNow();
-  nextRefreshAtMs = millis() + settings.refreshSeconds * 1000UL;
-  retryDelaySeconds = kInitialRetryDelaySeconds;
   uiState = UiState::kReady;
   lastErrorDetail = "";
-  return true;
+}
+
+void refreshSources(const DueSources& due) {
+  if (!anyDue(due)) return;
+  if (!connectWiFi()) {
+    // 联网失败时，本轮到期的每一行都显示同一个网络错误。
+    if (due.claude) sourceFailed(claudeSource, true, uiState, lastErrorDetail);
+    if (due.deepseek) sourceFailed(deepseekBalances.status, false, uiState, lastErrorDetail);
+    if (due.openrouter) sourceFailed(openrouterBalances.status, false, uiState, lastErrorDetail);
+    return;
+  }
+  if (due.claude) {
+    if (!refreshClaudeUsage()) {
+      sourceFailed(claudeSource, true, uiState, lastErrorDetail);
+    }
+  }
+  if (due.deepseek) {
+    refreshBalanceGroup("api.deepseek.com", "https://api.deepseek.com/user/balance",
+                        settings.deepseekKeys, balance_protocol::parseDeepSeek,
+                        deepseekBalances);
+  }
+  if (due.openrouter) {
+    refreshBalanceGroup("openrouter.ai", "https://openrouter.ai/api/v1/credits",
+                        settings.openrouterKeys, balance_protocol::parseOpenRouter,
+                        openrouterBalances);
+  }
 }
 
 String formatDuration(uint32_t seconds, bool extended = false) {
@@ -737,8 +791,10 @@ void drawWindowLine(int16_t y, const RateWindow& window, bool rightAlignPercent 
   const uint32_t now = epochNow();
   const uint32_t remainSeconds = window.resetAt > now ? window.resetAt - now : 0;
   const float remaining = 100.0f - window.usedPercent;
-  const String label = window.resetAt ? formatDuration(remainSeconds)
-      : (window.durationSeconds == claude::kFiveHourSeconds ? "5h" : "7d");
+  // 时钟未同步时 resetAt 无法换算成剩余时间，显示 -- 而不是把时间戳当天数。
+  const String label = window.resetAt == 0
+      ? String(window.durationSeconds == claude::kFiveHourSeconds ? "5h" : "7d")
+      : (now == 0 ? String("--") : formatDuration(remainSeconds));
   const String percent = String(static_cast<int>(roundf(remaining))) + "%";
   const String prefix = "[" + label + "]" + (rightAlignPercent ? "" : "  " + percent);
   display.setFont(u8g2_font_7x14_tf);
@@ -749,7 +805,8 @@ void drawWindowLine(int16_t y, const RateWindow& window, bool rightAlignPercent 
 
   const int16_t x = display.getStrWidth(prefix.c_str()) + 4;
   drawDeltaGlyph(x, y);
-  if (window.resetAt == 0 || window.durationSeconds == 0) {
+  // 配速同样由 resetAt 与当前时间算出；时钟未就绪时两者都不可用。
+  if (window.resetAt == 0 || window.durationSeconds == 0 || now == 0) {
     display.drawStr(x + 9, y, "--");
     return;
   }
@@ -767,12 +824,28 @@ void drawWindowLine(int16_t y, const RateWindow& window, bool rightAlignPercent 
   display.drawStr(x + 9, y, delta.c_str());
 }
 
-String formatLastRefresh() {
-  const uint32_t now = epochNow();
-  if (lastRefreshEpoch == 0 || now == 0 || now < lastRefreshEpoch) return "--";
-  const uint32_t elapsedSeconds = now - lastRefreshEpoch;
-  if (elapsedSeconds < 60) return "<1m 前";
-  return String(elapsedSeconds / 60) + "m 前";
+// 视图 2：左侧平台名（可带 * 陈旧标记）与过期时间，右侧状态词。
+// 排版由 quota::statusLineLayout 决定，放不下时先丢平台名再丢 *，状态词始终完整。
+void drawStatusLine(int16_t top, const char* label, bool stale, const char* age,
+                    const char* state) {
+  display.setFont(u8g2_font_6x12_tf);  // ASCII 走 6×12，与中文 12×12 同高
+  const quota::StatusLineLayout layout = quota::statusLineLayout(
+      128, uiTextWidth(state), label[0] != '\0' ? uiTextWidth(label) : 0,
+      uiTextWidth(age), stale);
+  if (layout.showLabel) drawUiText(layout.labelX, top, label);
+  if (layout.showStar) drawUiText(layout.starX, top, "*");
+  if (layout.showAge) drawUiText(layout.ageX, top, age);
+  if (state[0] != '\0') drawUiText(layout.stateX, top, state);
+}
+
+// 视图 2 的整行：平台名（可带 *）、过期时间、状态词。age 由调用方给栈上缓冲区。
+void drawStatusRow(int16_t y, const char* label, bool stale, uint32_t lastOkMs,
+                   uint32_t intervalSeconds, UiState state) {
+  char age[12];
+  if (!quota::ageSince(lastOkMs, millis(), intervalSeconds, age, sizeof(age))) {
+    std::snprintf(age, sizeof(age), "--");
+  }
+  drawStatusLine(y - 11, label, stale, age, uiMessage(state));
 }
 
 // 多个余额用 + 拼接，+ 左右各留 1px，避免与两侧数字贴在一起。
@@ -860,24 +933,46 @@ void drawBalanceLine(int16_t y, const char* label, const BalanceGroup& group) {
   drawJoinedAmount(x, y, amount);
 }
 
+// 沿用原来的行距和观感：三行仍相隔 16px，整屏上下各留半行（8px）空闲，
+// 只是把原来底部状态行占的位置换成了与上下对称的白边。
+constexpr int16_t kRowClaudeY = 20;
+constexpr int16_t kRowDeepseekY = 36;
+constexpr int16_t kRowOpenrouterY = 52;
+
+void drawClaudeRow(int16_t y, uint8_t phase) {
+  if (quota::showStatusView(quota::abnormal(claudeSource.state), phase)) {
+    drawStatusRow(y, "Claude", false, claudeSource.lastOkMs, quota::kClaudeRefreshSeconds,
+                  claudeSource.state);
+    return;
+  }
+  drawWindowLine(y, sevenDay, true);
+}
+
+void drawBalanceRow(int16_t y, const char* label, const BalanceGroup& group, uint8_t phase) {
+  const bool stale = group.stale && group.anyPresent();
+  if (quota::showStatusView(quota::abnormal(group.status.state), phase)) {
+    drawStatusRow(y, label, stale, group.status.lastOkMs, quota::kBalanceRefreshSeconds,
+                  group.status.state);
+    return;
+  }
+  drawBalanceLine(y, label, group);
+}
+
+// 没有任何异常行时两个视图完全相同，不需要为了轮换重画。
+bool anyRowAbnormal() {
+  return quota::abnormal(claudeSource.state) ||
+         quota::abnormal(deepseekBalances.status.state) ||
+         quota::abnormal(openrouterBalances.status.state);
+}
+
 void drawScreen() {
   display.clearBuffer();
-  drawWindowLine(14, sevenDay, true);
-  drawBalanceLine(30, "deepseek", deepseekBalances);
-  drawBalanceLine(46, "openrouter", openrouterBalances);
-  const int16_t statusTop = 51;
-
-  display.setFont(u8g2_font_6x12_tf);
-  String lastRefresh = formatLastRefresh();
-  const char* status = uiMessage(uiState);
-  const int16_t ageSpace = 128 - uiTextWidth(status) - (status[0] ? 6 : 0);
-  if (uiTextWidth(lastRefresh.c_str()) > ageSpace) lastRefresh = ageSpace >= 12 ? "--" : "";
-  drawUiText(0, statusTop, lastRefresh.c_str());
-  if (status[0] != '\0') {
-    const int16_t width = uiTextWidth(status);
-    drawUiText(max<int16_t>(0, 128 - width), statusTop, status);
-  }
+  const uint8_t phase = quota::viewPhase(millis());
+  drawClaudeRow(kRowClaudeY, phase);
+  drawBalanceRow(kRowDeepseekY, "deepseek", deepseekBalances, phase);
+  drawBalanceRow(kRowOpenrouterY, "openrouter", openrouterBalances, phase);
   display.sendBuffer();
+  drawnPhase = phase;
 }
 
 void sendResponse(cJSON* response) {
@@ -914,8 +1009,6 @@ void handleSerialCommand(const String& line) {
     cJSON_AddStringToObject(response, "error", "命令格式错误");
   } else if (command == "configure") {
     Settings candidate = settings;
-    cJSON* refreshMinutes = cJSON_GetObjectItemCaseSensitive(root, "refresh_minutes");
-    cJSON* refreshSeconds = cJSON_GetObjectItemCaseSensitive(root, "refresh_seconds");
     cJSON* utcOffset = cJSON_GetObjectItemCaseSensitive(root, "utc_offset_minutes");
     cJSON* expiresAt = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
     const bool authFieldsProvided =
@@ -934,9 +1027,8 @@ void handleSerialCommand(const String& line) {
         cJSON_GetObjectItemCaseSensitive(root, "wifi_password") != nullptr;
 
     // 部分更新：只校验并套用请求里出现的字段，其余保留设备原值。
-    bool valid = ssidProvided || passwordProvided || refreshMinutes != nullptr ||
-                 refreshSeconds != nullptr ||
-                 utcOffset != nullptr || authFieldsProvided || keyFieldsProvided;
+    bool valid = ssidProvided || passwordProvided || utcOffset != nullptr ||
+                 authFieldsProvided || keyFieldsProvided;
     if (ssidProvided) {
       valid = valid && jsonString(root, "wifi_ssid", candidate.wifiSsid) &&
               !candidate.wifiSsid.isEmpty();
@@ -944,7 +1036,6 @@ void handleSerialCommand(const String& line) {
     if (passwordProvided) {
       valid = valid && jsonString(root, "wifi_password", candidate.wifiPassword);
     }
-    valid = valid && quota::readRefreshSeconds(root, candidate.refreshSeconds);
     if (utcOffset != nullptr) {
       valid = valid && cJSON_IsNumber(utcOffset) &&
               utcOffset->valuedouble >= -840 && utcOffset->valuedouble <= 840;
@@ -986,8 +1077,6 @@ void handleSerialCommand(const String& line) {
       settings = candidate;
       if (saveSettings()) {
         addResponseBase(response, requestId, true);
-        cJSON_AddNumberToObject(response, "refresh_minutes", settings.refreshSeconds / 60.0);
-        cJSON_AddNumberToObject(response, "refresh_seconds", settings.refreshSeconds);
         if (deepseekProvided) {
           resetBalanceGroup(deepseekBalances, settings.deepseekKeys);
         }
@@ -996,10 +1085,7 @@ void handleSerialCommand(const String& line) {
         }
         WiFi.disconnect(true, false);
         refreshRequested = true;
-        nextRefreshAtMs = 0;
-        uiState = settings.configurationInvalid() ? UiState::kConfigError :
-            (settings.configured() ? UiState::kLoading : UiState::kUnconfigured);
-        retryDelaySeconds = kInitialRetryDelaySeconds;
+        uiState = settings.configured() ? UiState::kLoading : UiState::kUnconfigured;
         lastErrorDetail = "";
       } else {
         addResponseBase(response, requestId, false);
@@ -1028,8 +1114,8 @@ void handleSerialCommand(const String& line) {
       lastRefreshEpoch = 0;
       // A fresh authorization must trigger an immediate fetch.
       refreshRequested = true;
-      nextRefreshAtMs = 0;
-      retryDelaySeconds = kInitialRetryDelaySeconds;
+      claudeSource.retryDelaySeconds = kInitialRetryDelaySeconds;
+      claudeSource.dueAtMs = 0;
       lastErrorDetail = "";
       uiState = settings.configured() ? UiState::kLoading : UiState::kUnconfigured;
       addResponseBase(response, requestId, true);
@@ -1056,10 +1142,7 @@ void handleSerialCommand(const String& line) {
         cJSON_AddStringToObject(response, "account_id", settings.accountId.c_str());
         WiFi.disconnect(true, false);
         refreshRequested = true;
-        nextRefreshAtMs = 0;
-        uiState = settings.configurationInvalid() ? UiState::kConfigError :
-            (settings.configured() ? UiState::kLoading : UiState::kUnconfigured);
-        retryDelaySeconds = kInitialRetryDelaySeconds;
+        uiState = settings.configured() ? UiState::kLoading : UiState::kUnconfigured;
         lastErrorDetail = "";
       } else {
         addResponseBase(response, requestId, false);
@@ -1126,19 +1209,48 @@ void handleSerialCommand(const String& line) {
     };
     addBalance("deepseek_balance", "deepseek_balances", deepseekBalances);
     addBalance("openrouter_balance", "openrouter_balances", openrouterBalances);
+    auto addSourceStatus = [&](const char* name, const SourceStatus& source) {
+      cJSON* row = cJSON_AddObjectToObject(response, name);
+      cJSON_AddStringToObject(row, "state", uiMessage(source.state));
+      cJSON_AddStringToObject(row, "error_detail", source.detail.c_str());
+      // -1 表示这一行还没有过成功记录；0 才是“刚刚成功过”，两者不能混。
+      cJSON_AddNumberToObject(row, "age_seconds",
+                              source.lastOkMs == 0 ? -1
+                                  : static_cast<double>((millis() - source.lastOkMs) / 1000UL));
+      const int32_t dueMs = static_cast<int32_t>(source.dueAtMs - millis());
+      cJSON_AddNumberToObject(row, "next_refresh_seconds",
+                              source.dueAtMs != 0 && dueMs > 0 ? dueMs / 1000 : 0);
+    };
+    addSourceStatus("claude_status", claudeSource);
+    addSourceStatus("deepseek_status", deepseekBalances.status);
+    addSourceStatus("openrouter_status", openrouterBalances.status);
     cJSON_AddBoolToObject(response, "configured", settings.configured());
     cJSON_AddBoolToObject(response, "codex_configured", settings.codexConfigured());
     cJSON_AddBoolToObject(response, "deepseek_configured", settings.deepseekConfigured());
     cJSON_AddBoolToObject(response, "openrouter_configured", settings.openrouterConfigured());
     cJSON_AddBoolToObject(response, "wifi_connected", WiFi.status() == WL_CONNECTED);
-    cJSON_AddNumberToObject(response, "refresh_minutes", settings.refreshSeconds / 60.0);
-    cJSON_AddNumberToObject(response, "refresh_seconds", settings.refreshSeconds);
     cJSON_AddNumberToObject(response, "last_refresh", lastRefreshEpoch);
-    const int32_t nextMs = static_cast<int32_t>(nextRefreshAtMs - millis());
-    cJSON_AddNumberToObject(response, "next_refresh_seconds",
-                            nextRefreshAtMs != 0 && nextMs > 0 ? nextMs / 1000 : 0);
     cJSON_AddStringToObject(response, "state", uiMessage(uiState));
     cJSON_AddStringToObject(response, "error_detail", lastErrorDetail.c_str());
+    // 屏幕上此刻实际显示的视图号：没有异常行时固定是视图 1，也不轮换。
+    const bool rotating = anyRowAbnormal();
+    cJSON_AddNumberToObject(response, "view_phase",
+                            rotating ? quota::viewPhase(millis()) : 1);
+    cJSON_AddBoolToObject(response, "rows_rotating", rotating);
+    // 顶层字段保留兼容：三个来源里最早的一次自动抓取。
+    uint32_t nextDue = 0;
+    const uint32_t nowMs = millis();
+    const SourceStatus* rows[] = {
+        &claudeSource, &deepseekBalances.status, &openrouterBalances.status};
+    for (const SourceStatus* row : rows) {
+      if (row->dueAtMs == 0) continue;
+      if (nextDue == 0 || static_cast<int32_t>(row->dueAtMs - nextDue) < 0) {
+        nextDue = row->dueAtMs;
+      }
+    }
+    const int32_t nextMs = static_cast<int32_t>(nextDue - nowMs);
+    cJSON_AddNumberToObject(response, "next_refresh_seconds",
+                            nextDue != 0 && nextMs > 0 ? nextMs / 1000 : 0);
     cJSON_AddNumberToObject(response, "wifi_status", static_cast<int>(WiFi.status()));
     cJSON_AddNumberToObject(response, "wifi_rssi",
                             WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
@@ -1157,6 +1269,7 @@ void handleSerialCommand(const String& line) {
     refreshRequested = true;
   } else if (command == "erase") {
     clearSettings();
+    drawScreen();
     addResponseBase(response, requestId, true);
     cJSON_AddStringToObject(response, "state", "未配置");
   } else {
@@ -1219,9 +1332,7 @@ void setup() {
   display.setBusClock(kI2cFrequency);
   display.begin();
   loadSettings();
-  uiState = settings.configurationInvalid()
-      ? UiState::kConfigError
-      : (settings.configured() ? UiState::kConnecting : UiState::kUnconfigured);
+  uiState = settings.configured() ? UiState::kConnecting : UiState::kUnconfigured;
   drawScreen();
   Serial.printf("READY OLED=0x%02X SCL=%u SDA=%u\n",
                 kDisplayI2cAddress, pins::kI2cClock, pins::kI2cData);
@@ -1232,18 +1343,19 @@ void loop() {
   processSerial();
   updateKeys();
   const uint32_t now = millis();
-  if (settings.configured() && nextRefreshAtMs != 0 &&
-      static_cast<int32_t>(now - nextRefreshAtMs) >= 0) {
-    refreshRequested = true;
-  }
-  if (refreshRequested && settings.configured()) {
-    refreshRequested = false;
-    uiState = UiState::kLoading;
-    drawScreen();
-    refreshQuota();
-    if (uiState != UiState::kReady) {
-      scheduleRetry();
+  if (settings.configured()) {
+    // 三个来源各自到期；手动刷新（按键 / fetchNow）让它们同时尝试。
+    const DueSources due = dueSources(refreshRequested, now);
+    if (anyDue(due)) {
+      refreshRequested = false;
+      // 刷新进行中不算异常，屏幕上不出现「正在刷新」，也不做多余的全屏重画。
+      refreshSources(due);
+      syncOverallState();
+      drawScreen();
     }
+  }
+  // 有异常行时视图按相位轮换；没有异常行时两个视图相同，不必重画。
+  if (anyRowAbnormal() && quota::viewPhase(millis()) != drawnPhase) {
     drawScreen();
   }
   if (static_cast<int32_t>(now - nextRedrawAtMs) >= 0) {

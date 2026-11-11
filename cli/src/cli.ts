@@ -26,8 +26,6 @@ update 选项（至少指定一个；未指定的参数保持设备原值不变�
   --password PASSWORD   更新 Wi-Fi 密码
   --deepseek-key KEY     更新 DeepSeek 余额 key；可重复或用逗号分隔，最多 4 个
   --openrouter-key KEY   更新 OpenRouter 余额 key；可重复或用逗号分隔，最多 4 个
-  --interval MIN        更新刷新间隔 1～1440 分钟（与 --interval-seconds 互斥）
-  --interval-seconds SEC 更新刷新间隔 50～86400 秒（整数）
   --utc-offset +HH:MM   更新时区偏移
   --port PORT           手动指定串口；默认自动发现 Espressif 设备
 
@@ -50,33 +48,6 @@ export function parseUtcOffset(value: string): number {
     throw new CliError("时区偏移超出有效范围");
   }
   return result;
-}
-
-function parseInterval(value: string): number {
-  if (!/^\d+$/.test(value)) throw new CliError("刷新间隔必须是整数分钟");
-  const interval = Number(value);
-  if (interval < 1 || interval > 1440) {
-    throw new CliError("刷新间隔必须在 1～1440 分钟之间");
-  }
-  return interval;
-}
-
-export function parseRefreshInterval(
-  minutes: string | undefined,
-  seconds: string | undefined,
-): { refresh_minutes?: number; refresh_seconds?: number } {
-  if (minutes !== undefined && seconds !== undefined) {
-    throw new CliError("--interval 与 --interval-seconds 不能同时指定");
-  }
-  if (seconds !== undefined) {
-    if (!/^\d+$/.test(seconds)) throw new CliError("刷新间隔必须是整数秒");
-    const interval = Number(seconds);
-    if (interval < 50 || interval > 86400) {
-      throw new CliError("刷新间隔必须在 50～86400 秒之间");
-    }
-    return { refresh_seconds: interval };
-  }
-  return minutes === undefined ? {} : { refresh_minutes: parseInterval(minutes) };
 }
 
 function requireString(value: string | undefined, option: string): string {
@@ -141,15 +112,10 @@ async function updateDevice(args: string[]): Promise<void> {
       password: { type: "string" },
       "deepseek-key": { type: "string", multiple: true },
       "openrouter-key": { type: "string", multiple: true },
-      interval: { type: "string" },
-      "interval-seconds": { type: "string" },
       "utc-offset": { type: "string" },
     },
   });
-  const payload: Record<string, unknown> = {
-    cmd: "configure",
-    ...parseRefreshInterval(values.interval, values["interval-seconds"]),
-  };
+  const payload: Record<string, unknown> = { cmd: "configure" };
 
   // 两个平台可以独立更新；同一平台的多个 key 以换行分隔下放设备。
   const deepseekKeys = parseApiKeys(values["deepseek-key"], "--deepseek-key");
@@ -177,7 +143,7 @@ async function updateDevice(args: string[]): Promise<void> {
   const updatedFields = Object.keys(payload).filter((key) => key !== "cmd");
   if (updatedFields.length === 0) {
     throw new CliError(
-      "请至少指定一个要更新的参数：--ssid / --password / --deepseek-key / --openrouter-key / --interval / --interval-seconds / --utc-offset",
+      "请至少指定一个要更新的参数：--ssid / --password / --deepseek-key / --openrouter-key / --utc-offset",
     );
   }
 

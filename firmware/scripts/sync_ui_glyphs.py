@@ -219,7 +219,12 @@ inline const uint8_t* find(uint16_t codepoint) {{
 
 
 def sync(firmware_dir: Path, check: bool) -> tuple[int, int]:
-    source_files = [firmware_dir / "src" / "main.cpp"]
+    # 界面文案里出现的中文字形从这些源文件收集；新增含中文的源文件时要加进来，
+    # 否则字形缺失，屏幕上会画出空白。
+    source_files = [
+        firmware_dir / "src" / "main.cpp",
+        firmware_dir / "src" / "row_view.h",
+    ]
     characters = collect_chinese_characters(source_files)
     if not characters:
         raise FontError("固件源码中没有找到中文字符串")
