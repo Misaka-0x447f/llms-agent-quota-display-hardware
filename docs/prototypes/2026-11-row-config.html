@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>可配置行 — 目标体验草案</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px; background: #14161a; color: #e6e8ee;
+         font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa3b2; margin: 0 0 24px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 24px; }
+  .card { background: #1c1f25; border: 1px solid #2b303a; border-radius: 12px; padding: 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 2px; font-weight: 600; }
+  .cfg { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+         color: #7fd1a8; background: #15181d; border: 1px solid #2b303a; border-radius: 6px;
+         padding: 6px 8px; margin: 6px 0 12px; word-break: break-all; }
+  .note { color: #9aa3b2; font-size: 12px; margin: 10px 0 0; max-width: 300px; }
+  /* 128x64 OLED, 3x */
+  .oled { width: 384px; height: 192px; background: #05070a; border: 2px solid #2b303a;
+          border-radius: 8px; position: relative; overflow: hidden; }
+  .oled::after { content: ""; position: absolute; inset: 0;
+                 background: repeating-linear-gradient(0deg, rgba(255,255,255,.035) 0 1px, transparent 1px 3px);
+                 pointer-events: none; }
+  .px { position: absolute; color: #d8f3ff; font-family: ui-monospace, Menlo, monospace;
+        font-size: 10px; letter-spacing: 0; white-space: pre; }
+  .big { font-size: 14px; }
+  .zh { color: #d8f3ff; }
+  .line { position: absolute; height: 3px; background: #d8f3ff; opacity: .95; }
+  .tag { display: inline-block; font-size: 11px; color: #9aa3b2; border: 1px solid #3a404c;
+         border-radius: 999px; padding: 1px 8px; margin-left: 6px; vertical-align: 2px; }
+  .legend { margin-top: 26px; color: #9aa3b2; font-size: 12px; }
+  code { color: #e6e8ee; background: #23272f; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>可配置行 — 目标体验草案</h1>
+<p class="sub">OLED 区域按 128×64、3 倍放大绘制；文字位置对应固件基线 20 / 36 / 52（三行）。这是草案，不是已实现效果。</p>
+
+<div class="grid">
+  <div class="card">
+    <h2>默认：ChatGPT 7d + 两个余额 <span class="tag">3 行</span></h2>
+    <div class="cfg">--rows "chatgpt:7d,deepseek,openrouter"</div>
+    <div class="oled">
+      <div class="px big" style="left:6px;top:18px">[3d]</div>
+      <div class="px" style="left:54px;top:28px">Δ-4h</div>
+      <div class="px big" style="left:300px;top:18px">40%</div>
+      <div class="px" style="left:6px;top:66px">deepseek</div>
+      <div class="px big" style="left:264px;top:54px">12.34</div>
+      <div class="px" style="left:6px;top:114px">openrouter</div>
+      <div class="px big" style="left:264px;top:102px">56.78</div>
+    </div>
+    <p class="note">第一行与现在的 Claude 行同版式：重置倒计时、配速 Δ、剩余百分比。多 key 余额照旧用 <code>+</code> 拼接、失败 key 标 <code>*</code>。</p>
+  </div>
+
+  <div class="card">
+    <h2>出错时的视图 2 <span class="tag">每 2 秒轮换</span></h2>
+    <div class="cfg">同一配置，ChatGPT 抓取失败</div>
+    <div class="oled">
+      <div class="px" style="left:6px;top:66px">deepseek</div>
+      <div class="px big" style="left:264px;top:54px">12.34</div>
+      <div class="px" style="left:6px;top:114px">openrouter</div>
+      <div class="px big" style="left:264px;top:102px">56.78</div>
+      <div class="px" style="left:6px;top:18px">chatgpt</div>
+      <div class="px" style="left:60px;top:18px">&lt;10m</div>
+      <div class="px zh" style="left:246px;top:16px">登录失效</div>
+      <div class="line" style="left:6px;top:80px;width:96px"></div>
+    </div>
+    <p class="note">第一行换成「平台名 + 过期时间 + 状态词」，其余两行不动；底部 1px 线表示正在抓取的行。</p>
+  </div>
+
+  <div class="card">
+    <h2>只留两行 <span class="tag">2 行居中对齐</span></h2>
+    <div class="cfg">--rows "chatgpt:7d,deepseek"</div>
+    <div class="oled">
+      <div class="px big" style="left:6px;top:42px">[3d]</div>
+      <div class="px" style="left:54px;top:52px">Δ-4h</div>
+      <div class="px big" style="left:300px;top:42px">40%</div>
+      <div class="px" style="left:6px;top:90px">deepseek</div>
+      <div class="px big" style="left:264px;top:78px">12.34</div>
+    </div>
+    <p class="note">行数少于 3 时整体居中，行距仍 16px；未列出的来源完全不抓取（OpenRouter 不再每 50 秒请求）。</p>
+  </div>
+
+  <div class="card">
+    <h2>只留一行 <span class="tag">1 行居中</span></h2>
+    <div class="cfg">--rows "chatgpt:7d"</div>
+    <div class="oled">
+      <div class="px big" style="left:6px;top:78px">[3d]</div>
+      <div class="px" style="left:54px;top:88px">Δ-4h</div>
+      <div class="px big" style="left:300px;top:78px">40%</div>
+    </div>
+    <p class="note">适合只关心 ChatGPT 的场景；三行槽位空出来的空间不显示任何内容。</p>
+  </div>
+
+  <div class="card">
+    <h2>想同时看 5h 和 7d <span class="tag">同一来源占两行</span></h2>
+    <div class="cfg">--rows "chatgpt:5h,chatgpt:7d,openrouter"</div>
+    <div class="oled">
+      <div class="px big" style="left:6px;top:18px">[4h]</div>
+      <div class="px" style="left:54px;top:28px">Δ+12m</div>
+      <div class="px big" style="left:300px;top:18px">68%</div>
+      <div class="px big" style="left:6px;top:66px">[3d]</div>
+      <div class="px" style="left:54px;top:76px">Δ-4h</div>
+      <div class="px big" style="left:300px;top:66px">40%</div>
+      <div class="px" style="left:6px;top:114px">openrouter</div>
+      <div class="px big" style="left:264px;top:102px">56.78</div>
+    </div>
+    <p class="note">可选能力：窗口后缀 <code>5h</code> / <code>7d</code>。默认只用 <code>7d</code>。</p>
+  </div>
+</div>
+
+<div class="legend">
+  <p>配置写法（已定稿）：<code>--rows "chatgpt:7d,deepseek,openrouter"</code>，每行可加 <code>@间隔</code>，例如 <code>--rows "chatgpt:7d@5m,deepseek@30s"</code>。</p>
+  <p>未列出的来源保留凭据、不抓取、不上屏；Claude 默认不列出。最多 3 行，超出或写错由 <code>update</code> 直接报错，设备保留原配置。</p>
+  <p>行数少于 3 时整体居中；行距仍 16px；每行刷新间隔默认窗口 10 分钟、余额 50 秒。</p>
+</div>
+</body>
+</html>

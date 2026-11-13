@@ -58,10 +58,17 @@ void retry_after_handles_seconds_and_http_dates() {
   TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, claude::retryAfter("999999999999999999", now));
 }
 
+// 时钟未同步时不能把 epoch 0 当起点算出一个假过期时间；有效时钟才相加。
+void expiry_is_unknown_without_a_clock() {
+  TEST_ASSERT_EQUAL_UINT64(0, claude::expiryFor(0, 3600));
+  TEST_ASSERT_EQUAL_UINT64(1794400000ULL + 3600, claude::expiryFor(1794400000, 3600));
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(timestamps_are_utc_and_strict);
   RUN_TEST(snapshots_accept_optional_windows_and_preserve_last_good);
   RUN_TEST(retry_after_handles_seconds_and_http_dates);
+  RUN_TEST(expiry_is_unknown_without_a_clock);
   return UNITY_END();
 }

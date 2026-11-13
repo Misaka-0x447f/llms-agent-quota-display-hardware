@@ -3,24 +3,20 @@
 #include <stdint.h>
 
 namespace quota {
-// 抓取节奏按数据本身的更新速度定：Claude 的 7 天窗口不需要频繁抓，余额变化快。
-// 两个来源各自独立排队，互不拖慢。
-constexpr uint32_t kClaudeRefreshSeconds = 600;
+// 抓取节奏按数据本身的更新速度定：窗口类不需要频繁抓，余额变化快。
+// 具体间隔由行配置决定（默认窗口 10 分钟、余额 50 秒，可按行覆盖）。
+// 默认节奏：窗口类（ChatGPT/Claude）10 分钟，余额类 50 秒；行配置可逐行覆盖。
+constexpr uint32_t kWindowRefreshSeconds = 600;
 constexpr uint32_t kBalanceRefreshSeconds = 50;
-
-inline uint32_t refreshIntervalSeconds(bool claude) {
-  return claude ? kClaudeRefreshSeconds : kBalanceRefreshSeconds;
-}
 
 // dueAt == 0 表示该来源不在队列里；用无符号差值比较，可自然处理 millis 回绕。
 inline bool refreshDue(uint32_t nowMs, uint32_t dueAtMs) {
   return dueAtMs != 0 && static_cast<int32_t>(nowMs - dueAtMs) >= 0;
 }
 
-// 失败退避不短于该来源的正常间隔，避免 10 分钟一抓的 Claude 变成连续重试。
-inline uint32_t retryDelay(bool claude, uint32_t delaySeconds) {
-  const uint32_t interval = refreshIntervalSeconds(claude);
-  return delaySeconds < interval ? interval : delaySeconds;
+// 失败退避不短于该来源的正常间隔，避免 10 分钟一抓的来源变成连续重试。
+inline uint32_t retryDelay(uint32_t intervalSeconds, uint32_t delaySeconds) {
+  return delaySeconds < intervalSeconds ? intervalSeconds : delaySeconds;
 }
 
 // 一组 key 抓完后的调度选择：有 key 失败时这一行要显示异常，但只要还有 key

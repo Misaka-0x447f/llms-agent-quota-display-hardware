@@ -107,6 +107,13 @@ inline bool parseUsage(const char* json, RateWindow& five, RateWindow& seven) {
   return true;
 }
 
+// 令牌续期返回的是相对秒数。时钟没同步时算不出绝对时间，记 0（未知），
+// 不能把 epoch 0 当成起点写一个假时间。
+inline uint64_t expiryFor(uint32_t nowEpoch, uint32_t expiresInSeconds) {
+  return nowEpoch == 0 ? 0
+                       : static_cast<uint64_t>(nowEpoch) + expiresInSeconds;
+}
+
 // Retry-After accepts seconds or an IMF-fixdate. Ignore malformed values.
 inline uint32_t retryAfter(const char* text, uint32_t now) {
   if (!text || !*text) return 0;

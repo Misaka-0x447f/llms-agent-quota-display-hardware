@@ -27,13 +27,15 @@ PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -e esp32c3_supermini -t
   --upload-port /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_*-if00
 ```
 
-串口为 115200 baud。固件使用 NVS 明文保存 Wi-Fi 和 Claude 凭据；当前阶段
-没有启用 ESP32 Flash Encryption。默认显示 Claude 7 天额度、DeepSeek 和
-OpenRouter 余额；Claude 凭据存入独立的 `claude_auth` NVS 值，不复用旧令牌。
+串口为 115200 baud。固件使用 NVS 明文保存 Wi-Fi、ChatGPT（Codex）、Claude 和
+各平台余额凭据；当前阶段没有启用 ESP32 Flash Encryption。默认显示 ChatGPT 7 天
+额度、DeepSeek 和 OpenRouter 余额；Claude 凭据存入独立的 `claude_auth` NVS 值，
+不复用旧令牌。
 每个平台最多 4 个 API key，多个余额在屏幕上用 `+` 拼接，2 个及以上时每个
 金额保留一位小数；单个 key 仍保留两位小数。
 
-默认固件使用 `pnpm --dir cli codex-quota-device login --provider claude` 授权。
+默认固件使用 `pnpm --dir cli codex-quota-device login --provider chatgpt` 授权；
+`claude` 仍可用，只是默认不显示。
 
 正在抓取的行会在该行下面显示 1px 的进度条，线在行基线 +2（ink 下界见
 `scripts/font_ink_probe.c`，实测本行最低像素是基线 +1）。WiFi 重连阶段（最长
@@ -45,11 +47,13 @@ OpenRouter 余额；Claude 凭据存入独立的 `claude_auth` NVS 值，不复�
 变化）；动画只是在两次整屏重画之间补上实时反馈。只有真正发起抓取的行才置位
 `fetchingMask`，排队中的行没有线。
 
-电脑退出后，ESP32 自己请求用量及续期。屏幕三行依次是 Claude 7 天窗口、
-DeepSeek 余额、OpenRouter 余额；没有单独的底部状态行，出错时该行每 2 秒在数据
-与「过期时间 + 状态词」之间切换，三行共用同一相位。三行沿用原来的 16px 行距，
-上下各留出半行左右的空闲，观感与加底部状态行之前一致。Claude 用量每 10 分钟抓一次，
-余额每 50 秒抓一次，各自独立排队。Claude 5 小时窗口只解析不绘制。
+电脑退出后，ESP32 自己请求用量及续期。屏幕显示哪些行、顺序、窗口和刷新间隔
+由 NVS 的 `rows` 决定，默认 `chatgpt:7d,deepseek,openrouter`（最多 3 行，
+未列出的来源不抓取也不上屏）。没有单独的底部状态行，出错时该行每 2 秒在数据
+与「过期时间 + 状态词」之间切换，各行共用同一相位；行数少于 3 时整体居中。
+默认窗口类每 10 分钟抓一次、余额每 50 秒抓一次，每行可用 `@30s` / `@5m` 覆盖，
+同一来源占多行时取最短；各来源独立排队。5 小时窗口只在写进 `rows` 时才显示。
+ChatGPT 与 Claude 的凭据都按单个 NVS 值保存，续期前先写「进行中」状态。
 首次授权与设备续期都成功后，才算验证了独立运行能力。`login` 成功仅确认串口
 写入，不确认上游接口可用。
 
@@ -58,7 +62,7 @@ DeepSeek 余额、OpenRouter 余额；没有单独的底部状态行，出错时
 固件用 SNTP 常驻同步设备时钟，NTP 源固定为国内可达的 `ntp.aliyun.com`、
 `ntp1.aliyun.com`、`time.tencent.com`：只在尚未取到时间时启动一次，不阻塞
 抓取流程，之后每小时校正一次走时漂移。时钟只依赖 NTP，不用接口返回的时间校准。
-时钟未就绪时，Claude 行的重置倒计时和配速都显示 `--`；其余内容照常显示，
+时钟未就绪时，窗口行的重置倒计时和配速都显示 `--`；其余内容照常显示，
 HTTPS 也不受影响（ESP-IDF 默认不校验证书有效期）。服务端 429 的冷却截止时间
 是 Unix 时间，时钟未就绪时固件不认这个截止时间，避免冷启动把重试排到几天后。
 

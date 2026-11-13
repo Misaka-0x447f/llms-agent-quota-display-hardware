@@ -10,6 +10,8 @@
 
 #include "ui_glyphs.h"
 #include "claude_protocol.h"
+#include "codex_protocol.h"
+#include "row_config.h"
 #include "freshness_format.h"
 #include "refresh_plan.h"
 #include "row_view.h"
@@ -51,6 +53,10 @@ constexpr size_t kMaximumSerialCommandBytes = 64 * 1024;
 constexpr char kClaudeClientId[] = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 constexpr char kClaudeTokenUrl[] = "https://platform.claude.com/v1/oauth/token";
 constexpr char kClaudeUsageUrl[] = "https://api.anthropic.com/api/oauth/usage";
+// ChatGPT（Codex CLI）用量：OAuth token 续期 + wham usage。
+constexpr char kCodexClientId[] = "app_EMoamEEZ73f0CkXaXp7hrann";
+constexpr char kCodexTokenUrl[] = "https://auth.openai.com/oauth/token";
+constexpr char kCodexUsageUrl[] = "https://chatgpt.com/backend-api/wham/usage";
 
 struct ClaudeAuth {
   String provisionId;
@@ -72,6 +78,14 @@ U8G2_SSD1315_128X64_NONAME_F_SW_I2C display(
     U8G2_R0, pins::kI2cClock, pins::kI2cData, U8X8_PIN_NONE);
 Preferences preferences;
 
+// 主循环和动画任务都会碰显示屏与 u8g2 缓冲，必须串行。
+// 行配置也由主循环写、动画任务读，所以写入同样走这把锁。
+SemaphoreHandle_t displayMutex = nullptr;
+
+// 屏幕行配置：来源、顺序、窗口；由 NVS 的 `rows` 字符串决定。
+quota::RowConfig rowConfigs[quota::kMaxRows];
+size_t rowCount = 0;
+
 struct Settings {
   String wifiSsid;
   String wifiPassword;
@@ -80,8 +94,18 @@ struct Settings {
   String accountId;
   String deepseekKeys;
   String openrouterKeys;
+  // rows 控制「显示哪些来源」：形如 chatgpt:7d,deepseek,openrouter。
+  // 没写进 rows 的来源不排队、不抓取、不上屏，凭据仍保留在 NVS。
+  String rows;
   uint64_t expiresAt = 0;
   int16_t utcOffsetMinutes = 0;
+  // ChatGPT 的续期状态跟随凭据一起持久化：pending 表示上一次续期结果不确定
+  // （响应丢失/非可重试错误），needsLogin 表示上游明确拒绝，两种都不再自动重试。
+  bool codexPending = false;
+  bool codexNeedsLogin = false;
+  // 最近一次安装 ChatGPT 凭据的串口 request_id；重发同一请求只确认、不重装，
+  // 避免把已经被轮换掉的旧 refresh token 又写回来（Claude 用 provisionId 防同类问题）。
+  String codexProvisionId;
 
   bool codexConfigured() const {
     return !accessToken.isEmpty() && !refreshToken.isEmpty() && !accountId.isEmpty();
@@ -91,12 +115,24 @@ struct Settings {
 
   bool openrouterConfigured() const { return !openrouterKeys.isEmpty(); }
 
-  // 本版本只采集和显示 Claude；保留旧平台凭据但不再轮询旧数据源。
-  bool credentialsPresent() const {
-    return !wifiSsid.isEmpty() && claudeAuth.configured();
+  bool hasCredentials(quota::RowSource source) const {
+    switch (source) {
+      case quota::RowSource::kChatgpt: return codexConfigured();
+      case quota::RowSource::kClaude: return claudeAuth.configured();
+      case quota::RowSource::kDeepseek: return deepseekConfigured();
+      case quota::RowSource::kOpenrouter: return openrouterConfigured();
+    }
+    return false;
   }
 
-  bool configured() const { return credentialsPresent(); }
+  // 设备级配置：有 Wi-Fi，且至少一个写在 rows 里的来源有凭据。
+  bool configured() const {
+    if (wifiSsid.isEmpty() || rowCount == 0) return false;
+    for (size_t i = 0; i < rowCount; ++i) {
+      if (hasCredentials(rowConfigs[i].source)) return true;
+    }
+    return false;
+  }
 };
 
 // 每个来源（Claude 用量、每个平台的余额）各自记录显示状态、数据新鲜度和排队时刻。
@@ -138,9 +174,57 @@ struct Key {
 Settings settings;
 RateWindow fiveHour;
 RateWindow sevenDay;
+RateWindow chatgptFive;
+RateWindow chatgptSeven;
+// 时钟未同步时 expiresAt 只能是 0（未知），用单调时钟限制主动续期频率：
+// 至少 60 分钟才主动续一次；access token 真过期时走 401 触发的续期。
+constexpr uint32_t kMinimumTokenRefreshMs = 60 * 60 * 1000UL;
+uint32_t codexTokenRefreshMs = 0;
+uint32_t claudeTokenRefreshMs = 0;
 SourceStatus claudeSource;
+SourceStatus chatgptSource;
 BalanceGroup deepseekBalances;
 BalanceGroup openrouterBalances;
+
+// 行配置与数据源之间的唯一映射，绘制、调度、串口字段都从这里取。
+SourceStatus* statusFor(quota::RowSource source) {
+  switch (source) {
+    case quota::RowSource::kChatgpt: return &chatgptSource;
+    case quota::RowSource::kClaude: return &claudeSource;
+    case quota::RowSource::kDeepseek: return &deepseekBalances.status;
+    case quota::RowSource::kOpenrouter: return &openrouterBalances.status;
+  }
+  return nullptr;
+}
+
+bool rowEnabled(quota::RowSource source) {
+  for (size_t i = 0; i < rowCount; ++i) {
+    if (rowConfigs[i].source == source) return true;
+  }
+  return false;
+}
+
+// 没写进 rows 的来源不再抓取，也不该在 `status` 里继续报上一次的错误。
+// 只清状态字段（数据本身留着），重新加回行时会立即抓一次。
+void resetDisabledSourceStatus() {
+  const quota::RowSource sources[] = {quota::RowSource::kChatgpt, quota::RowSource::kClaude,
+                                      quota::RowSource::kDeepseek,
+                                      quota::RowSource::kOpenrouter};
+  for (quota::RowSource source : sources) {
+    if (rowEnabled(source)) continue;
+    SourceStatus* status = statusFor(source);
+    if (status != nullptr) *status = SourceStatus{};
+  }
+}
+
+// 动画任务在显示锁内读行配置；写入也必须持锁，避免读到「行数已变、内容还没换」的中间态。
+void applyRowConfig(const quota::RowConfig* rows, size_t count) {
+  if (displayMutex != nullptr) xSemaphoreTake(displayMutex, portMAX_DELAY);
+  const size_t limit = count > quota::kMaxRows ? quota::kMaxRows : count;
+  for (size_t i = 0; i < limit; ++i) rowConfigs[i] = rows[i];
+  rowCount = limit;
+  if (displayMutex != nullptr) xSemaphoreGive(displayMutex);
+}
 UiState uiState = UiState::kUnconfigured;
 String lastErrorDetail;
 Key keys[] = {
@@ -158,7 +242,7 @@ uint32_t nextRedrawAtMs = 0;
 uint8_t drawnPhase = 0;
 bool refreshRequested = false;
 bool sntpStarted = false;
-// 哪几行正在抓取（bit0 Claude、bit1 DeepSeek、bit2 OpenRouter）。这是 loading
+// 哪几行正在抓取（bit0 Claude、bit1 DeepSeek、bit2 OpenRouter、bit3 ChatGPT）。这是 loading
 // 动画唯一的开关：只在 refreshSources 里置位，函数返回时统一清零，所以「刷新
 // 循环从未启动」的配置不会留下一条永远转动的线。单字节写在单核上是原子的，
 // 读端在显示锁内读一次。
@@ -166,6 +250,7 @@ volatile uint8_t fetchingMask = 0;
 constexpr uint8_t kFetchClaude = 1u << 0;
 constexpr uint8_t kFetchDeepseek = 1u << 1;
 constexpr uint8_t kFetchOpenrouter = 1u << 2;
+constexpr uint8_t kFetchChatgpt = 1u << 3;
 constexpr uint8_t kDisplayI2cAddress = 0x3c;
 
 uint32_t epochNow() {
@@ -180,25 +265,35 @@ void setError(UiState state, const String& detail) {
   lastErrorDetail = detail;
 }
 
-// 成功：记下数据新鲜度，按该来源固定的间隔排下一次。
-void sourceSucceeded(SourceStatus& source, bool claude) {
+// 成功：记下数据新鲜度，按该行配置的间隔排下一次。
+void sourceSucceeded(SourceStatus& source, uint32_t intervalSeconds) {
   source.state = UiState::kReady;
   source.detail = "";
   source.lastOkMs = millis();
   source.retryDelaySeconds = kInitialRetryDelaySeconds;
-  source.dueAtMs = millis() + quota::refreshIntervalSeconds(claude) * 1000UL;
+  source.dueAtMs = millis() + intervalSeconds * 1000UL;
   lastRefreshEpoch = epochNow();
 }
 
+// 该来源在 rows 里的抓取间隔：同一来源占多行时取最短的。
+uint32_t sourceInterval(quota::RowSource source) {
+  return quota::sourceIntervalSeconds(rowConfigs, rowCount, source);
+}
+
 // 失败：按该来源自己的间隔做退避；Claude 还要尊重服务端的 Retry-After 冷却。
-void scheduleSourceRetry(SourceStatus& source, bool claude) {
-  if (claude && claudeAuth.pending) {
+void scheduleSourceRetry(SourceStatus& source, uint32_t intervalSeconds) {
+  if (&source == &claudeSource && claudeAuth.pending) {
     // 凭据已失效：不再自动重试，避免连续触发 token 轮换。
     source.dueAtMs = 0;
     return;
   }
-  uint32_t wait = quota::retryDelay(claude, source.retryDelaySeconds);
-  if (claude) {
+  if (&source == &chatgptSource &&
+      (settings.codexPending || settings.codexNeedsLogin)) {
+    source.dueAtMs = 0;
+    return;
+  }
+  uint32_t wait = quota::retryDelay(intervalSeconds, source.retryDelaySeconds);
+  if (&source == &claudeSource) {
     // 冷却截止时间是 Unix 时间；时钟未同步时不能拿它算等待（见 refresh_plan.h）。
     const uint32_t now = epochNow();
     wait = max(wait, quota::cooldownRemainingSeconds(now != 0, claudeBlockedUntil, now));
@@ -210,17 +305,18 @@ void scheduleSourceRetry(SourceStatus& source, bool claude) {
 }
 
 // 把这一行的失败状态记下来并安排退避；状态与详情由调用方给，避免依赖全局。
-void sourceFailed(SourceStatus& source, bool claude, UiState state, const String& detail) {
+void sourceFailed(SourceStatus& source, uint32_t intervalSeconds, UiState state,
+                  const String& detail) {
   source.state = state;
   source.detail = detail;
-  scheduleSourceRetry(source, claude);
+  scheduleSourceRetry(source, intervalSeconds);
 }
 
 // 数据确实更新了、但这一行仍要显示失败（例如多 key 里只坏了一个）。
 // 调度完全复用成功路径，避免继承已经翻倍过的退避；展示状态再覆盖回异常。
-void sourcePartiallySucceeded(SourceStatus& source, bool claude, UiState state,
+void sourcePartiallySucceeded(SourceStatus& source, uint32_t intervalSeconds, UiState state,
                               const String& detail) {
-  sourceSucceeded(source, claude);
+  sourceSucceeded(source, intervalSeconds);
   source.state = state;
   source.detail = detail;
 }
@@ -296,9 +392,15 @@ void loadClaudeAuth() {
   if (root) {
     ClaudeAuth candidate;
     cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
+    // expires_at == 0 表示「未知」：时钟未同步时续期会写 0，重启后不能因为
+    // 判断不了绝对时间就把整份凭据丢掉。
+    const bool expiresValid =
+        cJSON_IsNumber(expires) &&
+        (expires->valuedouble == 0 ||
+         claude::integer(expires, kMinimumValidEpoch, UINT32_MAX));
     if (jsonString(root, "access_token", candidate.accessToken) &&
-        jsonString(root, "refresh_token", candidate.refreshToken) &&
-        claude::integer(expires, kMinimumValidEpoch, UINT32_MAX) && candidate.configured()) {
+        jsonString(root, "refresh_token", candidate.refreshToken) && expiresValid &&
+        candidate.configured()) {
       candidate.expiresAt = static_cast<uint64_t>(expires->valuedouble);
       jsonString(root, "provision_id", candidate.provisionId);
       candidate.pending = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "pending"));
@@ -307,6 +409,92 @@ void loadClaudeAuth() {
     cJSON_Delete(root);
   }
   claudeBlockedUntil = preferences.getUInt("claude_wait", 0);
+}
+
+// ChatGPT 凭据集中保存在单个 NVS 值里：一次写入，断电不会留下 access 与
+// refresh 不同代。旧的分散 key 只在迁移时读取。
+void loadCodexAuth() {
+  // 旧固件把凭据拆成 access/refresh/account/expires。只有这一组**完整**时才说明
+  // 有人用旧固件重新登录过（降级再升级），以它为准并重新迁移；迁移中断或旧固件
+  // 只写 expires 之类的残缺记录不能遮住完整的新记录。
+  const bool legacyComplete = !settings.accessToken.isEmpty() &&
+                              !settings.refreshToken.isEmpty() &&
+                              !settings.accountId.isEmpty();
+  if (legacyComplete) return;
+  // 优先读 blob；早期构建把它写成了 NVS string，读不到 blob 时回退。
+  size_t length = preferences.getBytesLength("chatgpt_auth");
+  String stored;
+  if (length > 0) {
+    char* buffer = static_cast<char*>(malloc(length + 1));
+    if (buffer == nullptr) return;
+    const size_t read = preferences.getBytes("chatgpt_auth", buffer, length);
+    buffer[read] = '\0';
+    stored = buffer;
+    free(buffer);
+  } else {
+    stored = preferences.getString("chatgpt_auth");
+  }
+  if (stored.isEmpty()) return;
+  cJSON* root = cJSON_ParseWithOpts(stored.c_str(), nullptr, true);
+  if (root == nullptr) return;
+  String access, refresh, account;
+  const cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires");
+  if (jsonString(root, "access", access) && !access.isEmpty() &&
+      jsonString(root, "refresh", refresh) && !refresh.isEmpty() &&
+      jsonString(root, "account", account)) {
+    settings.accessToken = access;
+    settings.refreshToken = refresh;
+    settings.accountId = account;
+    settings.expiresAt =
+        cJSON_IsNumber(expires) ? static_cast<uint64_t>(expires->valuedouble) : 0;
+    settings.codexPending =
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "pending"));
+    settings.codexNeedsLogin =
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "needs_login"));
+    String provision;
+    if (jsonString(root, "provision", provision)) settings.codexProvisionId = provision;
+  }
+  cJSON_Delete(root);
+}
+
+bool saveCodexAuth() {
+  if (settings.accessToken.isEmpty() && settings.refreshToken.isEmpty() &&
+      settings.accountId.isEmpty()) {
+    preferences.remove("chatgpt_auth");
+    return true;
+  }
+  cJSON* root = cJSON_CreateObject();
+  if (root == nullptr) return false;
+  // 单值写入只保证「一起提交」，不保证字段齐全：任一字段分配失败都不能落盘。
+  const bool complete =
+      cJSON_AddStringToObject(root, "access", settings.accessToken.c_str()) != nullptr &&
+      cJSON_AddStringToObject(root, "refresh", settings.refreshToken.c_str()) != nullptr &&
+      cJSON_AddStringToObject(root, "account", settings.accountId.c_str()) != nullptr &&
+      cJSON_AddNumberToObject(root, "expires", static_cast<double>(settings.expiresAt)) !=
+          nullptr &&
+      cJSON_AddBoolToObject(root, "pending", settings.codexPending) != nullptr &&
+      cJSON_AddBoolToObject(root, "needs_login", settings.codexNeedsLogin) != nullptr &&
+      cJSON_AddStringToObject(root, "provision", settings.codexProvisionId.c_str()) != nullptr;
+  if (!complete) {
+    cJSON_Delete(root);
+    return false;
+  }
+  char* text = cJSON_PrintUnformatted(root);
+  bool ok = text != nullptr;
+  if (ok) {
+    // 用 blob 而不是 NVS string：string 单值上限约 4000 B，长 token 会写不进去。
+    const size_t length = strlen(text);
+    ok = length > 0 && preferences.putBytes("chatgpt_auth", text, length) == length;
+    cJSON_free(text);
+  }
+  cJSON_Delete(root);
+  if (!ok) return false;
+  // 迁移到单值后删掉旧的分散 key，避免两套记录混用。
+  preferences.remove("access");
+  preferences.remove("refresh");
+  preferences.remove("account");
+  preferences.remove("expires");
+  return true;
 }
 
 void resetBalanceGroup(BalanceGroup& group, const String& rawKeys) {
@@ -328,7 +516,25 @@ void loadSettings() {
   settings.deepseekKeys = preferences.getString("deepseek");
   settings.openrouterKeys = preferences.getString("openrouter");
   settings.expiresAt = preferences.getULong64("expires", 0);
+  loadCodexAuth();
+  // 旧固件把 ChatGPT 凭据拆成 access/refresh/account/expires 四个 key；当它们组成
+  // 完整的旧记录时（首次升级，或降级后旧固件又写过），以它们为准重新迁到单值存储，
+  // 避免单值里留着更旧的 token；残缺残留不参与判断，随迁移一起清掉。
+  if (settings.codexConfigured() &&
+      (preferences.isKey("access") || preferences.isKey("refresh") ||
+       preferences.isKey("account") || preferences.isKey("expires"))) {
+    saveCodexAuth();
+  }
   settings.utcOffsetMinutes = preferences.getShort("utc_off", 0);
+  settings.rows = preferences.getString("rows");
+  quota::RowConfig loadedRows[quota::kMaxRows];
+  size_t loadedCount = 0;
+  if (!quota::parseRows(settings.rows.c_str(), settings.rows.length(), loadedRows, loadedCount)) {
+    // 没写过或写坏的旧值都回到默认：第一行 ChatGPT 7 天，再加两个余额。
+    settings.rows = quota::kDefaultRows;
+    quota::parseRows(settings.rows.c_str(), settings.rows.length(), loadedRows, loadedCount);
+  }
+  applyRowConfig(loadedRows, loadedCount);
   resetBalanceGroup(deepseekBalances, settings.deepseekKeys);
   resetBalanceGroup(openrouterBalances, settings.openrouterKeys);
 }
@@ -344,10 +550,7 @@ bool saveSettings() {
     preferences.remove("wifi_ssid");
   }
   preferences.putString("wifi_pass", settings.wifiPassword);
-  // Claude-only devices legitimately have no legacy Codex credentials.
-  if (!settings.accessToken.isEmpty()) ok &= preferences.putString("access", settings.accessToken) > 0;
-  if (!settings.refreshToken.isEmpty()) ok &= preferences.putString("refresh", settings.refreshToken) > 0;
-  if (!settings.accountId.isEmpty()) ok &= preferences.putString("account", settings.accountId) > 0;
+  ok &= saveCodexAuth();
   if (!settings.deepseekKeys.isEmpty()) {
     ok &= preferences.putString("deepseek", settings.deepseekKeys) > 0;
   } else {
@@ -358,8 +561,8 @@ bool saveSettings() {
   } else {
     preferences.remove("openrouter");
   }
-  ok &= preferences.putULong64("expires", settings.expiresAt) > 0;
   ok &= preferences.putShort("utc_off", settings.utcOffsetMinutes) > 0;
+  if (!settings.rows.isEmpty()) ok &= preferences.putString("rows", settings.rows) > 0;
   return ok;
 }
 
@@ -373,6 +576,18 @@ void clearSettings() {
   openrouterBalances = BalanceGroup{};
   fiveHour = RateWindow{};
   sevenDay = RateWindow{};
+  chatgptFive = RateWindow{};
+  chatgptSeven = RateWindow{};
+  chatgptSource = SourceStatus{};
+  codexTokenRefreshMs = 0;
+  claudeTokenRefreshMs = 0;
+  // 清空后回到默认行配置（ChatGPT 7d + 两个余额），凭据已经一起清掉。
+  settings.rows = quota::kDefaultRows;
+  quota::RowConfig defaultRows[quota::kMaxRows];
+  size_t defaultCount = 0;
+  if (quota::parseRows(settings.rows.c_str(), settings.rows.length(), defaultRows, defaultCount)) {
+    applyRowConfig(defaultRows, defaultCount);
+  }
   lastRefreshEpoch = 0;
   refreshRequested = false;
   WiFi.disconnect(true, true);
@@ -479,6 +694,8 @@ bool refreshClaudeToken() {
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
   const String body = "grant_type=refresh_token&client_id=" + formEncode(kClaudeClientId) +
                       "&refresh_token=" + formEncode(claudeAuth.refreshToken);
+  // 记录「尝试」时间，时钟未同步时用它限流。
+  claudeTokenRefreshMs = millis();
   ClaudeAuth pending = claudeAuth;
   pending.pending = true;
   if (!saveClaudeAuth(pending)) {
@@ -512,8 +729,10 @@ bool refreshClaudeToken() {
   bool valid = jsonString(root, "access_token", candidate.accessToken) &&
       jsonString(root, "refresh_token", candidate.refreshToken) && candidate.configured() &&
       claude::integer(expires, 1, 365 * 86400);
-  if (valid) candidate.expiresAt = static_cast<uint64_t>(epochNow()) +
-                                  static_cast<uint64_t>(expires->valuedouble);
+  if (valid) {
+    candidate.expiresAt = claude::expiryFor(
+        epochNow(), static_cast<uint32_t>(expires->valuedouble));
+  }
   cJSON_Delete(root);
   if (!valid) {
     setError(UiState::kAuthError, "Claude OAuth 续期响应无效，请重新运行 login");
@@ -564,13 +783,26 @@ bool refreshClaudeUsage() {
     return false;
   }
   bool refreshed = false;
-  if (claudeAuth.expiresAt <= static_cast<uint64_t>(epochNow()) + 120) {
+  bool tokenDue = false;
+  if (nowEpoch == 0) {
+    tokenDue = claudeTokenRefreshMs == 0 ||
+               millis() - claudeTokenRefreshMs >= kMinimumTokenRefreshMs;
+  } else {
+    tokenDue = claudeAuth.expiresAt == 0 ||
+               claudeAuth.expiresAt <= static_cast<uint64_t>(nowEpoch) + 120;
+  }
+  if (tokenDue) {
     if (!refreshClaudeToken()) return false;
     refreshed = true;
   }
   String response;
   int status = getClaudeUsage(response);
   if (status == 401 && !refreshed) {
+    // 刚续期过就先不连环续期，避免时钟未同步/上游异常时反复打 token 端点。
+    if (claudeTokenRefreshMs != 0 && millis() - claudeTokenRefreshMs < 60 * 1000UL) {
+      setError(UiState::kAuthError, "Claude 凭据验证失败，请稍后重试或重新 login");
+      return false;
+    }
     if (!refreshClaudeToken()) return false;
     status = getClaudeUsage(response);
   }
@@ -579,8 +811,12 @@ bool refreshClaudeUsage() {
       setError(classifyHttpStatus(status), "Claude 用量接口返回 HTTP " + String(status));
       if (status == 401 || status == 403) {
         // New credentials rejected, or scope missing: stop repeated token rotation.
+        // 状态必须落盘成功，否则重启后可能重放已经失效的 refresh token。
         claudeAuth.pending = true;
-        saveClaudeAuth(claudeAuth);
+        if (!saveClaudeAuth(claudeAuth)) {
+          setError(UiState::kConfigError, "无法保存 Claude 需要重新登录的状态");
+          return false;
+        }
       }
     }
     return false;
@@ -589,7 +825,172 @@ bool refreshClaudeUsage() {
     setError(UiState::kDataError, "Claude 用量响应缺少有效的 5h/7d 数据");
     return false;
   }
-  sourceSucceeded(claudeSource, true);
+  sourceSucceeded(claudeSource, sourceInterval(quota::RowSource::kClaude));
+  return true;
+}
+
+// ChatGPT（Codex CLI）OAuth 续期：refresh_token 换 access_token；服务端可能同时
+// 轮换 refresh token。和 Claude 一样，发请求前先把「进行中」落盘：如果响应丢失或
+// 掉电，下次不再重放可能已被上游消费的 refresh token，而是要求重新登录。
+bool refreshChatgptToken() {
+  if (settings.codexPending) {
+    setError(UiState::kAuthError, "ChatGPT 续期结果不确定，请重新运行 login");
+    return false;
+  }
+  if (!resolveHost("auth.openai.com")) return false;
+  WiFiClientSecure client;
+  client.setCACertBundle(rootca_crt_bundle_start);
+  HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(30000);
+  if (!http.begin(client, kCodexTokenUrl)) {
+    setError(UiState::kTransportError, "ChatGPT OAuth 请求初始化失败");
+    return false;
+  }
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  const String body = "grant_type=refresh_token&client_id=" + formEncode(kCodexClientId) +
+                      "&refresh_token=" + formEncode(settings.refreshToken);
+  // 记录「尝试」时间（不管成功与否），统一限制续期频率。
+  codexTokenRefreshMs = millis();
+  Settings pending = settings;
+  pending.codexPending = true;
+  settings = pending;
+  if (!saveCodexAuth()) {
+    http.end();
+    settings.codexPending = false;
+    setError(UiState::kConfigError, "无法保存 ChatGPT 续期状态，未发送请求");
+    return false;
+  }
+  const int status = http.POST(body);
+  const String response = status == 200 ? http.getString() : String();
+  http.end();
+  if (status <= 0) {
+    // 请求可能已经被上游处理：保留 pending，要求重新登录，避免重放旧 token。
+    settings = pending;
+    saveCodexAuth();
+    setError(UiState::kAuthError, "ChatGPT OAuth 续期响应丢失，请重新运行 login");
+    return false;
+  }
+  if (status != 200) {
+    // 只有明确可重试的拒绝才允许继续使用旧 refresh token；清除 pending 必须
+    // 先落盘成功，否则 RAM 说「可重试」而 NVS 仍停在「不确定」，重启后会误锁。
+    if (status == 429 || status >= 500) {
+      pending.codexPending = false;
+      Settings previousPending = settings;
+      settings = pending;
+      if (!saveCodexAuth()) settings = previousPending;
+    }
+    setError(settings.codexPending ? UiState::kAuthError : classifyHttpStatus(status),
+             "ChatGPT OAuth 服务返回 HTTP " + String(status));
+    return false;
+  }
+  cJSON* root = cJSON_ParseWithOpts(response.c_str(), nullptr, true);
+  const cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires_in");
+  Settings candidate = settings;
+  const bool valid = jsonString(root, "access_token", candidate.accessToken) &&
+                     !candidate.accessToken.isEmpty() &&
+                     claude::integer(expires, 1, 365 * 86400);
+  String rotatedRefresh;
+  if (valid && jsonString(root, "refresh_token", rotatedRefresh) &&
+      !rotatedRefresh.isEmpty()) {
+    candidate.refreshToken = rotatedRefresh;
+  }
+  if (valid) {
+    // 时钟还没同步时记「未知」（0），并用单调时钟限制续期频率（见 refreshChatgptUsage）。
+    candidate.expiresAt = claude::expiryFor(
+        epochNow(), static_cast<uint32_t>(expires->valuedouble));
+  }
+  cJSON_Delete(root);
+  if (!valid) {
+    setError(UiState::kAuthError, "ChatGPT OAuth 续期响应无效，请重新运行 login");
+    return false;
+  }
+  candidate.codexPending = false;
+  candidate.codexNeedsLogin = false;
+  const Settings previous = settings;
+  settings = candidate;
+  if (!saveCodexAuth()) {
+    settings = previous;
+    setError(UiState::kAuthError, "ChatGPT 新凭据写入失败，请重新运行 login");
+    return false;
+  }
+  return true;
+}
+
+int getChatgptUsage(String& response) {
+  if (!resolveHost("chatgpt.com")) return -1;
+  WiFiClientSecure client;
+  client.setCACertBundle(rootca_crt_bundle_start);
+  HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(15000);
+  if (!http.begin(client, kCodexUsageUrl)) {
+    setError(UiState::kTransportError, "ChatGPT 用量请求初始化失败");
+    return -1;
+  }
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + settings.accessToken);
+  http.addHeader("Chatgpt-Account-Id", settings.accountId);
+  http.addHeader("User-Agent", "codex_cli_rs/0.76.0 (ESP32-C3; quota-display)");
+  const int status = http.GET();
+  if (status == 200) response = http.getString();
+  http.end();
+  if (status <= 0) {
+    setError(transportState(status, client), transportDetail("ChatGPT 用量", status, client));
+  }
+  return status;
+}
+
+bool refreshChatgptUsage() {
+  // 续期结果不确定或被上游拒绝时不再自动重试，避免反复轮换 token。
+  if (settings.codexPending || settings.codexNeedsLogin) {
+    setError(UiState::kAuthError, "ChatGPT 凭据需要重新授权，请运行 login");
+    return false;
+  }
+  bool refreshed = false;
+  const uint32_t nowEpoch = epochNow();
+  bool tokenDue = false;
+  if (nowEpoch == 0) {
+    tokenDue = codexTokenRefreshMs == 0 ||
+               millis() - codexTokenRefreshMs >= kMinimumTokenRefreshMs;
+  } else {
+    tokenDue = settings.expiresAt == 0 ||
+               settings.expiresAt <= static_cast<uint64_t>(nowEpoch) + 120;
+  }
+  if (tokenDue) {
+    if (!refreshChatgptToken()) return false;
+    refreshed = true;
+  }
+  String response;
+  int status = getChatgptUsage(response);
+  if (status == 401 && !refreshed) {
+    // 刚续期过（例如 401 紧跟一次续期尝试）就先不连环续期，避免在时钟未同步
+    // 或上游异常时按抓取间隔反复打 token 端点。
+    if (codexTokenRefreshMs != 0 && millis() - codexTokenRefreshMs < 60 * 1000UL) {
+      setError(UiState::kAuthError, "ChatGPT 凭据验证失败，请稍后重试或重新 login");
+      return false;
+    }
+    if (!refreshChatgptToken()) return false;
+    status = getChatgptUsage(response);
+  }
+  if (status != 200) {
+    if (status > 0) {
+      setError(classifyHttpStatus(status), "ChatGPT 用量接口返回 HTTP " + String(status));
+      if (status == 401 || status == 403) {
+        // 续期后仍被拒绝：停止自动续期，等用户重新 login。
+        settings.codexNeedsLogin = true;
+        saveCodexAuth();
+      }
+    }
+    return false;
+  }
+  if (!codex::parseUsage(response.c_str(), chatgptFive, chatgptSeven)) {
+    setError(UiState::kDataError, "ChatGPT 用量响应缺少有效的 5h/7d 数据");
+    return false;
+  }
+  sourceSucceeded(chatgptSource, sourceInterval(quota::RowSource::kChatgpt));
   return true;
 }
 
@@ -629,6 +1030,7 @@ bool refreshBalance(const char* host, const char* url, const String& key,
 // 同一平台的多个 key 逐个请求：单个 key 失败只标记它自己，其余 key 继续更新。
 // 行状态取第一个失败 key 的错误，视图 2 显示它；视图 1 保留 * 标记该行有陈旧值。
 void refreshBalanceGroup(const char* host, const char* url, const String& rawKeys,
+                         uint32_t intervalSeconds,
                          bool (*parse)(const char*, balance_protocol::Balance&),
                          BalanceGroup& group) {
   key_list::List keys;
@@ -636,7 +1038,7 @@ void refreshBalanceGroup(const char* host, const char* url, const String& rawKey
     setError(UiState::kDataError, String(host) + " 余额 key 配置无效");
     group.count = 0;
     group.stale = true;
-    sourceFailed(group.status, false, uiState, lastErrorDetail);
+    sourceFailed(group.status, intervalSeconds, uiState, lastErrorDetail);
     return;
   }
   group.count = keys.count;
@@ -657,20 +1059,22 @@ void refreshBalanceGroup(const char* host, const char* url, const String& rawKey
   }
   const quota::GroupDecision decision = quota::groupDecision(keys.count, failedCount);
   if (!decision.showError) {
-    sourceSucceeded(group.status, false);
+    sourceSucceeded(group.status, intervalSeconds);
     return;
   }
   // 部分 key 失败时错的那个由视图 1 的 * 标记、视图 2 显示它的状态，
   // 但这一行仍按 50 秒节奏继续抓，健康 key 的数据不能被一个坏 key 拖旧。
   if (decision.keepsSchedule) {
-    sourcePartiallySucceeded(group.status, false, firstError, firstDetail);
+    sourcePartiallySucceeded(group.status, intervalSeconds, firstError, firstDetail);
     return;
   }
-  sourceFailed(group.status, false, firstError, firstDetail);
+  sourceFailed(group.status, intervalSeconds, firstError, firstDetail);
 }
 
 // 三个来源各自排队，只刷新到期的那些；手动刷新时全部一起尝试。
+// 只有写进 rows 的来源才排队；不在屏幕上的来源完全不发请求。
 struct DueSources {
+  bool chatgpt;
   bool claude;
   bool deepseek;
   bool openrouter;
@@ -678,32 +1082,35 @@ struct DueSources {
 
 DueSources dueSources(bool manual, uint32_t nowMs) {
   DueSources due{};
-  due.claude = claudeAuth.configured() &&
+  due.chatgpt = rowEnabled(quota::RowSource::kChatgpt) && settings.codexConfigured() &&
+                (manual || quota::refreshDue(nowMs, chatgptSource.dueAtMs));
+  due.claude = rowEnabled(quota::RowSource::kClaude) && claudeAuth.configured() &&
                (manual || quota::refreshDue(nowMs, claudeSource.dueAtMs));
-  due.deepseek = settings.deepseekConfigured() &&
+  due.deepseek = rowEnabled(quota::RowSource::kDeepseek) &&
+                 settings.deepseekConfigured() &&
                  (manual || quota::refreshDue(nowMs, deepseekBalances.status.dueAtMs));
-  due.openrouter = settings.openrouterConfigured() &&
+  due.openrouter = rowEnabled(quota::RowSource::kOpenrouter) &&
+                   settings.openrouterConfigured() &&
                    (manual || quota::refreshDue(nowMs, openrouterBalances.status.dueAtMs));
   return due;
 }
 
 bool anyDue(const DueSources& due) {
-  return due.claude || due.deepseek || due.openrouter;
+  return due.chatgpt || due.claude || due.deepseek || due.openrouter;
 }
 
-// 全局状态只服务于既有串口语义：取第一个异常行，没有异常就是 kReady。
+// 全局状态只服务于既有串口语义：按行顺序取第一个异常行，没有异常就是 kReady。
 void syncOverallState() {
-  const SourceStatus* rows[] = {
-      &claudeSource, &deepseekBalances.status, &openrouterBalances.status};
-  for (const SourceStatus* row : rows) {
-    if (quota::abnormal(row->state)) {
+  uiState = UiState::kReady;
+  lastErrorDetail = "";
+  for (size_t i = 0; i < rowCount; ++i) {
+    const SourceStatus* row = statusFor(rowConfigs[i].source);
+    if (row != nullptr && quota::abnormal(row->state)) {
       uiState = row->state;
       lastErrorDetail = row->detail;
       return;
     }
   }
-  uiState = UiState::kReady;
-  lastErrorDetail = "";
 }
 
 void refreshSources(const DueSources& due) {
@@ -714,33 +1121,55 @@ void refreshSources(const DueSources& due) {
   } clearOnExit;
   // 联网阶段先把本轮到期的行都点亮：WiFi 重连最长 15 秒，这段时间也该有进度线。
   // 联网就绪后改成按来源逐个点亮，避免「还在排队却显示在抓取」。
-  fetchingMask = (due.claude ? kFetchClaude : 0) | (due.deepseek ? kFetchDeepseek : 0) |
+  fetchingMask = (due.chatgpt ? kFetchChatgpt : 0) | (due.claude ? kFetchClaude : 0) |
+                 (due.deepseek ? kFetchDeepseek : 0) |
                  (due.openrouter ? kFetchOpenrouter : 0);
   if (!connectWiFi()) {
     fetchingMask = 0;
     // 联网失败时，本轮到期的每一行都显示同一个网络错误。
-    if (due.claude) sourceFailed(claudeSource, true, uiState, lastErrorDetail);
-    if (due.deepseek) sourceFailed(deepseekBalances.status, false, uiState, lastErrorDetail);
-    if (due.openrouter) sourceFailed(openrouterBalances.status, false, uiState, lastErrorDetail);
+    if (due.chatgpt) {
+      sourceFailed(chatgptSource, sourceInterval(quota::RowSource::kChatgpt), uiState,
+                   lastErrorDetail);
+    }
+    if (due.claude) {
+      sourceFailed(claudeSource, sourceInterval(quota::RowSource::kClaude), uiState,
+                   lastErrorDetail);
+    }
+    if (due.deepseek) {
+      sourceFailed(deepseekBalances.status, sourceInterval(quota::RowSource::kDeepseek),
+                   uiState, lastErrorDetail);
+    }
+    if (due.openrouter) {
+      sourceFailed(openrouterBalances.status, sourceInterval(quota::RowSource::kOpenrouter),
+                   uiState, lastErrorDetail);
+    }
     return;
+  }
+  if (due.chatgpt) {
+    fetchingMask = kFetchChatgpt;
+    if (!refreshChatgptUsage()) {
+      sourceFailed(chatgptSource, sourceInterval(quota::RowSource::kChatgpt), uiState,
+                   lastErrorDetail);
+    }
   }
   if (due.claude) {
     fetchingMask = kFetchClaude;
     if (!refreshClaudeUsage()) {
-      sourceFailed(claudeSource, true, uiState, lastErrorDetail);
+      sourceFailed(claudeSource, sourceInterval(quota::RowSource::kClaude), uiState,
+                   lastErrorDetail);
     }
   }
   if (due.deepseek) {
     fetchingMask = kFetchDeepseek;
     refreshBalanceGroup("api.deepseek.com", "https://api.deepseek.com/user/balance",
-                        settings.deepseekKeys, balance_protocol::parseDeepSeek,
-                        deepseekBalances);
+                        settings.deepseekKeys, sourceInterval(quota::RowSource::kDeepseek),
+                        balance_protocol::parseDeepSeek, deepseekBalances);
   }
   if (due.openrouter) {
     fetchingMask = kFetchOpenrouter;
     refreshBalanceGroup("openrouter.ai", "https://openrouter.ai/api/v1/credits",
-                        settings.openrouterKeys, balance_protocol::parseOpenRouter,
-                        openrouterBalances);
+                        settings.openrouterKeys, sourceInterval(quota::RowSource::kOpenrouter),
+                        balance_protocol::parseOpenRouter, openrouterBalances);
   }
 }
 
@@ -961,98 +1390,124 @@ void drawBalanceLine(int16_t y, const char* label, const BalanceGroup& group) {
   drawJoinedAmount(x, y, amount);
 }
 
-// 沿用原来的行距和观感：三行仍相隔 16px，整屏上下各留半行（8px）空闲，
-// 只是把原来底部状态行占的位置换成了与上下对称的白边。
-constexpr int16_t kRowClaudeY = 20;
-constexpr int16_t kRowDeepseekY = 36;
-constexpr int16_t kRowOpenrouterY = 52;
-// loading 线紧贴本行文字下方。上下界来自实际渲染：7×14 的 "[" 顶到基线 −11、
-// 6×12 的 "deepseek"/"openrouter" 里 p 伸到基线 +1，视图 2 的中文 12×12 顶到 −11。
-// 因此线放在基线 +2，正好压在本行 ink 之下、离下一行 ink 还有 2px，读起来属于本行。
-constexpr int16_t kTextMaxTopRows = 11;
-constexpr int16_t kTextMaxBottomRows = 1;
-constexpr int16_t kRowClaudeLineY = kRowClaudeY + 2;
-constexpr int16_t kRowDeepseekLineY = kRowDeepseekY + 2;
-constexpr int16_t kRowOpenrouterLineY = kRowOpenrouterY + 2;
-static_assert(kRowClaudeLineY > kRowClaudeY + kTextMaxBottomRows, "line overlaps row 1");
-static_assert(kRowClaudeLineY + 1 <= kRowDeepseekY - kTextMaxTopRows, "line overlaps row 2");
-static_assert(kRowDeepseekLineY > kRowDeepseekY + kTextMaxBottomRows, "line overlaps row 2");
-static_assert(kRowDeepseekLineY + 1 <= kRowOpenrouterY - kTextMaxTopRows, "line overlaps row 3");
-static_assert(kRowOpenrouterLineY > kRowOpenrouterY + kTextMaxBottomRows, "line overlaps row 3");
-static_assert(kRowOpenrouterLineY < 64, "loading line off screen");
-// 每条线落在独立的 8px 页里，动画刷新一次只发一页。
-static_assert(kRowClaudeLineY / 8 != kRowDeepseekLineY / 8, "loading lines share a page");
-static_assert(kRowDeepseekLineY / 8 != kRowOpenrouterLineY / 8, "loading lines share a page");
-
-// 屏幕与三行的对应关系集中在这里，绘制和动画任务共用，避免两份列表走样。
+// 屏幕与行的对应关系不写死：行数、顺序、窗口来自 NVS 的 rows 配置，
+// 位置来自 quota::rowLayout()。绘制、动画和调度共用同一份映射。
 constexpr int16_t kDisplayWidth = 128;
-struct RowSlot {
-  int16_t baselineY;
-  int16_t lineY;
+
+struct RowView {
+  quota::RowConfig config;
+  quota::RowSlotLayout slot;
+  SourceStatus* status;
+  const RateWindow* window;
+  const BalanceGroup* balances;
+  const char* label;
   uint8_t fetchBit;
 };
-constexpr RowSlot kRows[] = {
-    {kRowClaudeY, kRowClaudeLineY, kFetchClaude},
-    {kRowDeepseekY, kRowDeepseekLineY, kFetchDeepseek},
-    {kRowOpenrouterY, kRowOpenrouterLineY, kFetchOpenrouter},
-};
-constexpr size_t kRowCount = sizeof(kRows) / sizeof(kRows[0]);
-static_assert(kRowCount == 3, "three rows expected");
 
-void drawClaudeRow(int16_t y, uint8_t phase) {
-  const bool hasData = sevenDay.present;
-  if (quota::showStatusView(quota::abnormal(claudeSource.state), hasData, phase)) {
-    drawStatusRow(y, "claude", false, claudeSource.lastOkMs, quota::kClaudeRefreshSeconds,
-                  claudeSource.state);
-    return;
+uint8_t fetchBitFor(quota::RowSource source) {
+  switch (source) {
+    case quota::RowSource::kChatgpt: return kFetchChatgpt;
+    case quota::RowSource::kClaude: return kFetchClaude;
+    case quota::RowSource::kDeepseek: return kFetchDeepseek;
+    case quota::RowSource::kOpenrouter: return kFetchOpenrouter;
   }
-  drawWindowLine(y, sevenDay, true);
+  return 0;
 }
 
-void drawBalanceRow(int16_t y, const char* label, const BalanceGroup& group, uint8_t phase) {
-  const bool stale = group.stale && group.anyPresent();
-  if (quota::showStatusView(quota::abnormal(group.status.state), group.anyPresent(), phase)) {
-    drawStatusRow(y, label, stale, group.status.lastOkMs, quota::kBalanceRefreshSeconds,
-                  group.status.state);
+// 按当前配置生成行视图；rowCount 为 0（还没加载配置）时返回 0，屏幕上不画东西。
+size_t buildRows(RowView* rows) {
+  quota::RowSlotLayout layout[quota::kMaxRows];
+  if (!quota::rowLayout(rowCount, layout)) return 0;
+  for (size_t i = 0; i < rowCount; ++i) {
+    RowView& row = rows[i];
+    row.config = rowConfigs[i];
+    row.slot = layout[i];
+    row.status = statusFor(rowConfigs[i].source);
+    row.label = quota::rowSourceName(rowConfigs[i].source);
+    row.fetchBit = fetchBitFor(rowConfigs[i].source);
+    row.window = nullptr;
+    row.balances = nullptr;
+    switch (rowConfigs[i].source) {
+      case quota::RowSource::kChatgpt:
+        row.window = rowConfigs[i].window == quota::WindowKind::kFiveHour ? &chatgptFive
+                                                                          : &chatgptSeven;
+        break;
+      case quota::RowSource::kClaude:
+        row.window = rowConfigs[i].window == quota::WindowKind::kFiveHour ? &fiveHour
+                                                                          : &sevenDay;
+        break;
+      case quota::RowSource::kDeepseek:
+        row.balances = &deepseekBalances;
+        break;
+      case quota::RowSource::kOpenrouter:
+        row.balances = &openrouterBalances;
+        break;
+    }
+  }
+  return rowCount;
+}
+
+bool rowHasData(const RowView& row) {
+  return row.window != nullptr ? row.window->present
+                               : (row.balances != nullptr && row.balances->anyPresent());
+}
+
+// 窗口行没有多 key 概念，不存在「旧值」标记；余额行才可能标 *。
+bool rowStale(const RowView& row) {
+  return row.balances != nullptr && row.balances->stale && row.balances->anyPresent();
+}
+
+void drawRow(const RowView& row, uint8_t phase) {
+  if (quota::showStatusView(quota::abnormal(row.status->state), rowHasData(row), phase)) {
+    // 新鲜度按「该来源实际生效的间隔」判定：同一来源占多行时抓取取最短的
+    // 间隔，展示也用同一个值，避免 5h/7d 两行对同一份数据给出不同新旧。
+    drawStatusRow(row.slot.textY, row.label, rowStale(row), row.status->lastOkMs,
+                  sourceInterval(row.config.source), row.status->state);
     return;
   }
-  drawBalanceLine(y, label, group);
+  if (row.window != nullptr) {
+    drawWindowLine(row.slot.textY, *row.window, true);
+  } else {
+    drawBalanceLine(row.slot.textY, row.label, *row.balances);
+  }
 }
 
 // 没有任何异常行时两个视图完全相同，不需要为了轮换重画。
 bool anyRowAbnormal() {
-  return quota::abnormal(claudeSource.state) ||
-         quota::abnormal(deepseekBalances.status.state) ||
-         quota::abnormal(openrouterBalances.status.state);
+  for (size_t i = 0; i < rowCount; ++i) {
+    const SourceStatus* status = statusFor(rowConfigs[i].source);
+    if (status != nullptr && quota::abnormal(status->state)) return true;
+  }
+  return false;
 }
 
-// 先把三条 1px 线清空，再给 mask 里正在抓取的行画上高光；屏幕外的部分由 u8g2 裁掉。
+// 先把行内的 1px 线清空，再给 mask 里正在抓取的行画上高光；屏幕外的部分由 u8g2 裁掉。
 // 只由动画任务调用：整屏重画不再画线，避免「全屏画过、任务却不知道」的残影。
-void drawLoadingLines(uint32_t nowMs, uint8_t mask) {
+void drawLoadingLines(const RowView* rows, size_t count, uint32_t nowMs, uint8_t mask) {
   const quota::LoadingBarSpan span = quota::loadingBarSpan(nowMs, kDisplayWidth);
   display.setDrawColor(0);
-  for (const RowSlot& row : kRows) display.drawBox(0, row.lineY, kDisplayWidth, 1);
+  for (size_t i = 0; i < count; ++i) {
+    display.drawBox(0, rows[i].slot.lineY, kDisplayWidth, 1);
+  }
   display.setDrawColor(1);
-  for (const RowSlot& row : kRows) {
-    if ((mask & row.fetchBit) != 0) {
-      display.drawBox(span.x, row.lineY, span.width, 1);
+  for (size_t i = 0; i < count; ++i) {
+    if ((mask & rows[i].fetchBit) != 0) {
+      display.drawBox(span.x, rows[i].slot.lineY, span.width, 1);
     }
   }
 }
 
-// 主循环和动画任务都会碰显示屏与 u8g2 缓冲，必须串行。
-SemaphoreHandle_t displayMutex = nullptr;
 // 整屏重画后线会被一起刷掉，动画任务下一帧必须整段补画一次（而不是只补两端）。
 // 写端和读端都在 displayMutex 里，所以不需要额外同步。
 bool loadingBarNeedsFullFlush = true;
 
 void drawScreen() {
   if (displayMutex != nullptr) xSemaphoreTake(displayMutex, portMAX_DELAY);
-  display.clearBuffer();
+  RowView rows[quota::kMaxRows];
+  const size_t count = buildRows(rows);
   const uint8_t phase = quota::viewPhase(millis());
-  drawClaudeRow(kRowClaudeY, phase);
-  drawBalanceRow(kRowDeepseekY, "deepseek", deepseekBalances, phase);
-  drawBalanceRow(kRowOpenrouterY, "openrouter", openrouterBalances, phase);
+  display.clearBuffer();
+  for (size_t i = 0; i < count; ++i) drawRow(rows[i], phase);
   display.sendBuffer();
   loadingBarNeedsFullFlush = true;
   drawnPhase = phase;
@@ -1070,21 +1525,25 @@ void loadingAnimationTask(void*) {
     if (fetchingMask != 0 || paintedMask != 0) {
       if (displayMutex != nullptr && xSemaphoreTake(displayMutex, pdMS_TO_TICKS(40)) == pdTRUE) {
         const uint8_t mask = fetchingMask;  // 锁内再读一次，避免判断和绘制看到不同状态
-        drawLoadingLines(now, mask);
+        RowView rows[quota::kMaxRows];
+        const size_t count = buildRows(rows);
+        drawLoadingLines(rows, count, now, mask);
         const quota::LoadingBarSpan span = quota::loadingBarSpan(now, kDisplayWidth);
         const uint8_t dirty = static_cast<uint8_t>(mask | paintedMask);
         // 整段重画只在「刚起步 / 行数变了 / 整屏刚重画过」时用；其余帧只补两端。
-        const bool fullFlush = loadingBarNeedsFullFlush || dirty != paintedMask;
+        // 位集合有任何变化（包括「从多行切到少行」）都要整段补画：缓冲里的线
+        // 已整体清空，只补两端会留下被移除那几行的残余高光。
+        const bool fullFlush = loadingBarNeedsFullFlush || mask != paintedMask;
         const quota::LoadingBarFlush flush =
             fullFlush ? quota::loadingBarFlush(previousX, span.x, quota::kLoadingBarWidth,
                                                kDisplayWidth)
                       : quota::loadingBarFlushDiff(previousX, span.x, quota::kLoadingBarWidth,
                                                    kDisplayWidth);
         for (uint8_t s = 0; s < flush.count; ++s) {
-          for (size_t i = 0; i < kRowCount; ++i) {
-            if ((dirty & kRows[i].fetchBit) == 0) continue;
+          for (size_t i = 0; i < count; ++i) {
+            if ((dirty & rows[i].fetchBit) == 0) continue;
             display.updateDisplayArea(flush.spans[s].tx,
-                                      static_cast<uint8_t>(kRows[i].lineY / 8),
+                                      static_cast<uint8_t>(rows[i].slot.lineY / 8),
                                       flush.spans[s].tw, 1);
           }
         }
@@ -1143,6 +1602,13 @@ void handleSerialCommand(const String& line) {
         cJSON_GetObjectItemCaseSensitive(root, "deepseek_key") != nullptr;
     const bool openrouterProvided =
         cJSON_GetObjectItemCaseSensitive(root, "openrouter_key") != nullptr;
+    const bool rowsProvided = cJSON_GetObjectItemCaseSensitive(root, "rows") != nullptr;
+    // 同一请求的重发（USB 重试/重启后重放）不得重新安装已经处理过的凭据：
+    // 期间设备可能已经续期并轮换掉旧 refresh token。
+    const bool authAlreadyApplied = authFieldsProvided && !requestId.isEmpty() &&
+                                    requestId == settings.codexProvisionId;
+    quota::RowConfig parsedRows[quota::kMaxRows];
+    size_t parsedRowCount = 0;
     const bool keyFieldsProvided = deepseekProvided || openrouterProvided;
     const bool ssidProvided =
         cJSON_GetObjectItemCaseSensitive(root, "wifi_ssid") != nullptr;
@@ -1151,7 +1617,7 @@ void handleSerialCommand(const String& line) {
 
     // 部分更新：只校验并套用请求里出现的字段，其余保留设备原值。
     bool valid = ssidProvided || passwordProvided || utcOffset != nullptr ||
-                 authFieldsProvided || keyFieldsProvided;
+                 authFieldsProvided || keyFieldsProvided || rowsProvided;
     if (ssidProvided) {
       valid = valid && jsonString(root, "wifi_ssid", candidate.wifiSsid) &&
               !candidate.wifiSsid.isEmpty();
@@ -1163,7 +1629,7 @@ void handleSerialCommand(const String& line) {
       valid = valid && cJSON_IsNumber(utcOffset) &&
               utcOffset->valuedouble >= -840 && utcOffset->valuedouble <= 840;
     }
-    if (authFieldsProvided) {
+    if (authFieldsProvided && !authAlreadyApplied) {
       valid = valid &&
               jsonString(root, "access_token", candidate.accessToken) &&
               jsonString(root, "refresh_token", candidate.refreshToken) &&
@@ -1171,6 +1637,12 @@ void handleSerialCommand(const String& line) {
               cJSON_IsNumber(expiresAt) && expiresAt->valuedouble > 0 &&
               !candidate.accessToken.isEmpty() && !candidate.refreshToken.isEmpty() &&
               !candidate.accountId.isEmpty();
+    }
+    if (rowsProvided) {
+      // 行配置在设备侧再校验一次：空列表、超过 3 行、未知来源或非法窗口都拒绝。
+      valid = valid && jsonString(root, "rows", candidate.rows) &&
+              quota::parseRows(candidate.rows.c_str(), candidate.rows.length(), parsedRows,
+                               parsedRowCount);
     }
     if (keyFieldsProvided) {
       // 两个平台可以独立更新；每个平台的 key 列表最多 key_list::kMaxKeys 个。
@@ -1194,12 +1666,34 @@ void handleSerialCommand(const String& line) {
       if (utcOffset != nullptr) {
         candidate.utcOffsetMinutes = static_cast<int16_t>(utcOffset->valuedouble);
       }
-      if (authFieldsProvided) {
+      if (authFieldsProvided && !authAlreadyApplied) {
         candidate.expiresAt = static_cast<uint64_t>(expiresAt->valuedouble);
+        // 新凭据必须解除上一轮的 pending / needs-login，否则永远不会再自动抓取。
+        candidate.codexPending = false;
+        candidate.codexNeedsLogin = false;
+        // 记下这次安装请求，重发时只确认、不重装。
+        candidate.codexProvisionId = requestId;
       }
+      const Settings previous = settings;
       settings = candidate;
       if (saveSettings()) {
         addResponseBase(response, requestId, true);
+        if (rowsProvided) {
+          applyRowConfig(parsedRows, parsedRowCount);
+          resetDisabledSourceStatus();
+          // 新加进来的来源立即排一次；被移除的来源不再排队（dueAtMs 不再被检查）。
+          chatgptSource.dueAtMs = 0;
+          claudeSource.dueAtMs = 0;
+          deepseekBalances.status.dueAtMs = 0;
+          openrouterBalances.status.dueAtMs = 0;
+        }
+        if (authFieldsProvided && !authAlreadyApplied) {
+          // 换账号后上一份用量不再属于当前凭据，先清掉再重画。
+          chatgptFive = RateWindow{};
+          chatgptSeven = RateWindow{};
+          chatgptSource = SourceStatus{};
+          codexTokenRefreshMs = millis();
+        }
         if (deepseekProvided) {
           resetBalanceGroup(deepseekBalances, settings.deepseekKeys);
         }
@@ -1210,7 +1704,11 @@ void handleSerialCommand(const String& line) {
         refreshRequested = true;
         uiState = settings.configured() ? UiState::kLoading : UiState::kUnconfigured;
         lastErrorDetail = "";
+        // 配置可能改变了行布局，也可能清空了数据：立即按最终状态重画，不能等
+        // 一次可能很慢甚至不会发生的抓取。
+        drawScreen();
       } else {
+        settings = previous;
         addResponseBase(response, requestId, false);
         cJSON_AddStringToObject(response, "error", "配置写入失败");
       }
@@ -1234,19 +1732,27 @@ void handleSerialCommand(const String& line) {
       claudeAuth = candidate;
       fiveHour = RateWindow{};
       sevenDay = RateWindow{};
+      // 新账号：清掉旧错误/旧 age 和旧账号的 429 冷却，避免拖住首次验证。
+      claudeSource = SourceStatus{};
+      claudeBlockedUntil = 0;
+      preferences.remove("claude_wait");
+      claudeTokenRefreshMs = millis();
       lastRefreshEpoch = 0;
-      // A fresh authorization must trigger an immediate fetch.
       refreshRequested = true;
-      claudeSource.retryDelaySeconds = kInitialRetryDelaySeconds;
-      claudeSource.dueAtMs = 0;
       lastErrorDetail = "";
       uiState = settings.configured() ? UiState::kLoading : UiState::kUnconfigured;
+      drawScreen();
       addResponseBase(response, requestId, true);
       cJSON_AddStringToObject(response, "provider", "claude");
     } else {
       addResponseBase(response, requestId, false);
       cJSON_AddStringToObject(response, "error", valid ? "Claude 凭据写入失败" : "Claude 登录字段无效");
     }
+  } else if (command == "login" && !requestId.isEmpty() &&
+             requestId == settings.codexProvisionId) {
+    // 同一登录请求的重发（USB 重试/重启后重放）：只确认，不重新安装旧 token。
+    addResponseBase(response, requestId, true);
+    cJSON_AddStringToObject(response, "account_id", settings.accountId.c_str());
   } else if (command == "login") {
     Settings candidate = settings;
     cJSON* expiresAt = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
@@ -1259,15 +1765,26 @@ void handleSerialCommand(const String& line) {
         !candidate.accountId.isEmpty();
     if (valid) {
       candidate.expiresAt = static_cast<uint64_t>(expiresAt->valuedouble);
+      candidate.codexPending = false;
+      candidate.codexNeedsLogin = false;
+      candidate.codexProvisionId = requestId;
+      const Settings previous = settings;
       settings = candidate;
-      if (saveSettings()) {
+      if (saveCodexAuth()) {
         addResponseBase(response, requestId, true);
         cJSON_AddStringToObject(response, "account_id", settings.accountId.c_str());
         WiFi.disconnect(true, false);
         refreshRequested = true;
+        // 新账号：清掉上一账号的用量快照与失败状态，首次成功抓取前不显示旧数据。
+        chatgptFive = RateWindow{};
+        chatgptSeven = RateWindow{};
+        chatgptSource = SourceStatus{};
+        codexTokenRefreshMs = millis();
         uiState = settings.configured() ? UiState::kLoading : UiState::kUnconfigured;
         lastErrorDetail = "";
+        drawScreen();
       } else {
+        settings = previous;
         addResponseBase(response, requestId, false);
         cJSON_AddStringToObject(response, "error", "登录凭据写入失败");
       }
@@ -1294,6 +1811,8 @@ void handleSerialCommand(const String& line) {
     };
     addWindow("five_hour", fiveHour);
     addWindow("seven_day", sevenDay);
+    addWindow("chatgpt_five_hour", chatgptFive);
+    addWindow("chatgpt_seven_day", chatgptSeven);
     auto addBalance = [&](const char* summaryName, const char* listName,
                           const BalanceGroup& group) {
       bool present = false;
@@ -1344,10 +1863,21 @@ void handleSerialCommand(const String& line) {
       cJSON_AddNumberToObject(row, "next_refresh_seconds",
                               source.dueAtMs != 0 && dueMs > 0 ? dueMs / 1000 : 0);
     };
+    addSourceStatus("chatgpt_status", chatgptSource);
     addSourceStatus("claude_status", claudeSource);
     addSourceStatus("deepseek_status", deepseekBalances.status);
     addSourceStatus("openrouter_status", openrouterBalances.status);
     cJSON_AddBoolToObject(response, "configured", settings.configured());
+    char rowsText[96] = {};
+    if (quota::formatRows(rowConfigs, rowCount, rowsText, sizeof(rowsText))) {
+      cJSON_AddStringToObject(response, "rows", rowsText);
+    } else {
+      cJSON_AddStringToObject(response, "rows", "");
+    }
+    cJSON_AddBoolToObject(response, "chatgpt_configured", settings.codexConfigured());
+    cJSON_AddBoolToObject(response, "chatgpt_needs_login",
+                          settings.codexNeedsLogin || settings.codexPending);
+    cJSON_AddBoolToObject(response, "chatgpt_pending", settings.codexPending);
     cJSON_AddBoolToObject(response, "codex_configured", settings.codexConfigured());
     cJSON_AddBoolToObject(response, "deepseek_configured", settings.deepseekConfigured());
     cJSON_AddBoolToObject(response, "openrouter_configured", settings.openrouterConfigured());
@@ -1360,13 +1890,12 @@ void handleSerialCommand(const String& line) {
     cJSON_AddNumberToObject(response, "view_phase",
                             rotating ? quota::viewPhase(millis()) : 1);
     cJSON_AddBoolToObject(response, "rows_rotating", rotating);
-    // 顶层字段保留兼容：三个来源里最早的一次自动抓取。
+    // 顶层字段保留兼容：当前显示的行里最早的一次自动抓取。
     uint32_t nextDue = 0;
     const uint32_t nowMs = millis();
-    const SourceStatus* rows[] = {
-        &claudeSource, &deepseekBalances.status, &openrouterBalances.status};
-    for (const SourceStatus* row : rows) {
-      if (row->dueAtMs == 0) continue;
+    for (size_t i = 0; i < rowCount; ++i) {
+      const SourceStatus* row = statusFor(rowConfigs[i].source);
+      if (row == nullptr || row->dueAtMs == 0) continue;
       if (nextDue == 0 || static_cast<int32_t>(row->dueAtMs - nextDue) < 0) {
         nextDue = row->dueAtMs;
       }

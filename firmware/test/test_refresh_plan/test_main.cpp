@@ -4,12 +4,10 @@
 void setUp() {}
 void tearDown() {}
 
-// 抓取节奏固定：Claude 10 分钟，余额 50 秒。
-void intervals_are_fixed_per_source() {
-  TEST_ASSERT_EQUAL_UINT32(600, quota::kClaudeRefreshSeconds);
+// 默认节奏：窗口类 10 分钟，余额 50 秒；每行可以在行配置里覆盖。
+void default_intervals_match_the_product_rules() {
+  TEST_ASSERT_EQUAL_UINT32(600, quota::kWindowRefreshSeconds);
   TEST_ASSERT_EQUAL_UINT32(50, quota::kBalanceRefreshSeconds);
-  TEST_ASSERT_EQUAL_UINT32(600, quota::refreshIntervalSeconds(true));
-  TEST_ASSERT_EQUAL_UINT32(50, quota::refreshIntervalSeconds(false));
 }
 
 // dueAt 为 0 表示不在队列里；到点才到期，用无符号差值比较可跨 millis 回绕。
@@ -24,14 +22,15 @@ void due_handles_never_scheduled_and_wraparound() {
   TEST_ASSERT_FALSE(quota::refreshDue(4000000000UL - 1, 4000000000UL));
 }
 
-// 失败退避不短于该来源的正常间隔，避免 Claude 被高频重试。
+// 失败退避不短于该行配置的间隔，避免高频重试。
 void retry_delay_never_goes_below_the_interval() {
-  TEST_ASSERT_EQUAL_UINT32(600, quota::retryDelay(true, 30));
-  TEST_ASSERT_EQUAL_UINT32(600, quota::retryDelay(true, 599));
-  TEST_ASSERT_EQUAL_UINT32(600, quota::retryDelay(true, 600));
-  TEST_ASSERT_EQUAL_UINT32(900, quota::retryDelay(true, 900));
-  TEST_ASSERT_EQUAL_UINT32(50, quota::retryDelay(false, 30));
-  TEST_ASSERT_EQUAL_UINT32(120, quota::retryDelay(false, 120));
+  TEST_ASSERT_EQUAL_UINT32(600, quota::retryDelay(600, 30));
+  TEST_ASSERT_EQUAL_UINT32(600, quota::retryDelay(600, 599));
+  TEST_ASSERT_EQUAL_UINT32(600, quota::retryDelay(600, 600));
+  TEST_ASSERT_EQUAL_UINT32(900, quota::retryDelay(600, 900));
+  TEST_ASSERT_EQUAL_UINT32(50, quota::retryDelay(50, 30));
+  TEST_ASSERT_EQUAL_UINT32(120, quota::retryDelay(50, 120));
+  TEST_ASSERT_EQUAL_UINT32(20, quota::retryDelay(20, 5));
 }
 
 // 时钟未同步时不能用 Unix 冷却截止时间：否则一个过去的截止时间会被算成
@@ -66,9 +65,8 @@ void partial_key_failure_keeps_the_normal_cadence() {
   const quota::GroupDecision oneOfFour = quota::groupDecision(4, 3);
   TEST_ASSERT_TRUE(oneOfFour.showError);
   TEST_ASSERT_TRUE(oneOfFour.keepsSchedule);
-  // 最小间隔本身不受退避影响：部分成功走的调度与全新成功一致。
-  TEST_ASSERT_EQUAL_UINT32(quota::kBalanceRefreshSeconds,
-                           quota::refreshIntervalSeconds(false));
+  // 部分成功走成功路径（sourcePartiallySucceeded 调 sourceSucceeded），
+  // 调度不使用 retryDelay；这条只在固件里可验证，单测不重复断言恒真值。
 }
 
 // 全部 key 失败才允许退避；全成功则不显示异常。
@@ -84,7 +82,7 @@ void whole_group_failure_is_the_only_retry_case() {
 
 int main() {
   UNITY_BEGIN();
-  RUN_TEST(intervals_are_fixed_per_source);
+  RUN_TEST(default_intervals_match_the_product_rules);
   RUN_TEST(due_handles_never_scheduled_and_wraparound);
   RUN_TEST(retry_delay_never_goes_below_the_interval);
   RUN_TEST(cooldown_requires_a_valid_clock);
