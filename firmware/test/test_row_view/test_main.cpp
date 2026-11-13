@@ -38,7 +38,7 @@ void error_states_have_a_readable_status_word() {
   TEST_ASSERT_EQUAL_STRING("", quota::uiMessage(UiState::kReady));
 }
 
-// 相位按 4 秒一拍交替，且只取决于时间：同一时刻所有行拿到同一个相位。
+// 相位按 2 秒一拍交替，且只取决于时间：同一时刻所有行拿到同一个相位。
 void phase_alternates_and_is_shared() {
   TEST_ASSERT_EQUAL_UINT8(1, quota::viewPhase(0));
   TEST_ASSERT_EQUAL_UINT8(1, quota::viewPhase(quota::kViewHoldMs - 1));
@@ -53,6 +53,9 @@ void phase_alternates_and_is_shared() {
     TEST_ASSERT_EQUAL_UINT8(phase == 1 ? 2 : 1, next);
   }
 }
+
+// 产品规则：每个视图停留 2 秒（用户 2026-11-13 确认；实现曾用 4 秒）。
+void view_hold_is_two_seconds() { TEST_ASSERT_EQUAL_UINT32(2000, quota::kViewHoldMs); }
 
 // 有数据时：只在异常行且相位为 2 才切视图 2；没有异常时两个视图完全相同。
 void status_view_requires_an_error_in_phase_two() {
@@ -85,16 +88,16 @@ void status_line_layout_never_overlaps() {
     bool expectAge;
   };
   const Case cases[] = {
-      // deepseek* <1m 请求超时：全部放得下
-      {48, 48, 18, true, true, true, true},
-      // WiFi无此网络：平台名让位，* 与过期时间保留
-      {72, 48, 18, true, false, true, true},
-      // 平台名很长且带 *：只留 * 与过期时间
+      // "deepseek" + 4 + "*" + "<50s"：40 + 6 + 24 = 70 ≤ 78，全部放得下
+      {48, 36, 24, true, true, true, true},
+      // 平台名 48：52 + 6 + 24 = 82 > 78，平台名让位，* 与过期时间保留
+      {48, 48, 24, true, false, true, true},
+      // 状态词更宽：只留 * 与过期时间
       {72, 96, 24, true, false, true, true},
       // 没有陈旧标记时只剩过期时间
       {48, 96, 24, false, false, false, true},
       // 极端状态词：整行让给状态词，不再画其它元素
-      {126, 48, 18, true, false, false, false},
+      {126, 48, 24, true, false, false, false},
   };
   for (const Case& c : cases) {
     const quota::StatusLineLayout layout =
@@ -278,6 +281,7 @@ int main() {
   RUN_TEST(failure_states_count_as_abnormal);
   RUN_TEST(error_states_have_a_readable_status_word);
   RUN_TEST(phase_alternates_and_is_shared);
+  RUN_TEST(view_hold_is_two_seconds);
   RUN_TEST(status_view_requires_an_error_in_phase_two);
   RUN_TEST(dataless_error_row_never_blinks);
   RUN_TEST(status_line_layout_never_overlaps);

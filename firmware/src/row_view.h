@@ -6,7 +6,8 @@ namespace quota {
 // 每行有两个视图：视图 1 是该行的数据，视图 2 是该行的过期时间与状态词。
 // 只有异常行才有视图 2，且所有行共用同一个相位，保证同一时刻看的是同一个视图号。
 // 空闲、刷新中、未配置都不是异常，这些状态下每行只有视图 1（等价于两个视图相同）。
-constexpr uint32_t kViewHoldMs = 4000;
+// 每个视图停留 2 秒（用户 2026-11-13 确认的节奏；实现曾用 4 秒）。
+constexpr uint32_t kViewHoldMs = 2000;
 
 enum class UiState : uint8_t {
   kUnconfigured,
