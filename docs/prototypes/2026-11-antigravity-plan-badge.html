@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Antigravity 额度行 + plan 徽标 — 目标体验草案</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 26px 26px 36px; background: #14161a; color: #e6e8ee;
+         font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #9aa3b2; margin: 0 0 20px; max-width: 980px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
+  .card { background: #1c1f25; border: 1px solid #2b303a; border-radius: 12px; padding: 14px; }
+  .card h2 { font-size: 14px; margin: 0 0 2px; font-weight: 600; }
+  .cfg { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+         color: #7fd1a8; background: #15181d; border: 1px solid #2b303a; border-radius: 6px;
+         padding: 5px 8px; margin: 6px 0 10px; word-break: break-all; }
+  .note { color: #9aa3b2; font-size: 12px; margin: 10px 0 0; max-width: 384px; }
+  .tag { display: inline-block; font-size: 11px; color: #9aa3b2; border: 1px solid #3a404c;
+         border-radius: 999px; padding: 1px 8px; margin-left: 6px; vertical-align: 2px; }
+  .oled { width: 384px; height: 192px; background: #05070a; border: 2px solid #2b303a;
+          border-radius: 8px; position: relative; overflow: hidden; flex: none; }
+  .oled::after { content: ""; position: absolute; inset: 0;
+                 background: repeating-linear-gradient(0deg, rgba(255,255,255,.035) 0 1px, transparent 1px 3px);
+                 pointer-events: none; }
+  /* 一个 7x14 字格按 3 倍放大 = 21x42 px */
+  .ch { position: absolute; width: 21px; height: 42px; line-height: 42px; text-align: center;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 26px;
+        color: #d8f3ff; letter-spacing: 0; }
+  .badge { position: absolute; background: #d8f3ff; }
+  .badge .ch { color: #05070a; }        /* 反色：块内字母是黑的 */
+  .tri { position: absolute; width: 0; height: 0; }
+  .zoom { position: relative; width: 384px; height: 192px; background: #05070a;
+          border: 2px solid #2b303a; border-radius: 8px; overflow: hidden; flex: none; }
+  .legend { margin-top: 26px; color: #9aa3b2; font-size: 12px; max-width: 980px; }
+  .legend b { color: #e6e8ee; font-weight: 600; }
+  code { color: #e6e8ee; background: #23272f; padding: 1px 5px; border-radius: 4px; }
+  .rule { margin: 2px 0; }
+</style>
+</head>
+<body>
+<h1>Antigravity 额度行 + plan 徽标 — 目标体验草案</h1>
+<p class="sub">OLED 区域按 128×64、3 倍放大绘制（1 个 7×14 字格 = 21×42 px，位置即固件里的真实像素坐标 ×3）。
+  <b>这是待确认的目标草案，不是已实现效果。</b>窗口行统一 7×14 字体；余额行不受影响。</p>
+
+<div class="grid" id="grid"></div>
+
+<div class="legend">
+  <p><b>徽标规则（已确认）</b></p>
+  <p class="rule">· 只有「订阅/窗口行」（chatgpt / claude / antigravity）带徽标，余额行（deepseek / openrouter）不带。</p>
+  <p class="rule">· 字母按厂商取：ChatGPT → <code>[O]</code>（OpenAI）、Antigravity → <code>[G]</code>（Google / Gemini）、Claude → <code>[A]</code>（Anthropic）。</p>
+  <p class="rule">· 反色显示：9×12 的实心块，字母镂空，压在重置倒计时左侧、共占 13px（9 块 + 4 间隔）。方块本身就是“反色”，不是打出来的方括号。</p>
+  <p class="rule">· 位置固定在最左边 x=0，重置时间整体右移 13px；Δ 与百分比的相对布局不变。</p>
+  <p><b>Antigravity 行（已确认）</b></p>
+  <p class="rule">· 来源写成 <code>antigravity</code>（只接受 7d，不接受 <code>:5h</code>），显示 Gemini 的每周额度。</p>
+  <p class="rule">· 剩余额度 &gt; 0 时：<code>[G] [5d] Δ+1h 63%</code>，与其他窗口行一致。</p>
+  <p class="rule">· 剩余额度 = 0%，或充值余额低于 <code>minimumCreditAmountForUsage</code> 时：丢掉 Δ，右侧改显示充值余额
+     <code>[G] [5d] 0%    12.34</code>。余额 = credits ÷ 100，两位小数，不带 <code>$</code>。</p>
+  <p class="rule">· 0% 但接口没给充值余额（非 Pro/Ultra 或字段缺失）：右侧显示 <code>--</code>，不拿 0.00 冒充。</p>
+</div>
+
+<script>
+const W = 128, S = 3;
+const grid = document.getElementById('grid');
+const CW = 7;   // 7x14 字体每个 ASCII 字符前进 7px
+
+function el(parent, cls, css) {
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  if (css) d.style.cssText = css;
+  parent.appendChild(d);
+  return d;
+}
+
+// 在基线上画一串字符；返回结束 x
+function drawStr(parent, x, baseline, text) {
+  for (const c of text) {
+    const d = el(parent, 'ch', `left:${x * S}px;top:${(baseline - 11) * S}px`);
+    d.textContent = c;
+    x += CW;
+  }
+  return x;
+}
+
+// 反色徽标：白色实心块 + 镂空字母
+function drawBadge(parent, x, baseline, letter) {
+  const box = el(parent, 'badge',
+    `left:${x * S - 1}px;top:${(baseline - 10) * S}px;width:${9 * S}px;height:${11 * S}px;border-radius:2px`);
+  const g = el(box, 'ch', `left:${1 * S}px;top:${(baseline - 11 - (baseline - 10)) * S}px`);
+  g.textContent = letter;
+  return x + 13;
+}
+
+// 窗口行：可选徽标 + 重置倒计时 + Δ + (配速 或 充值余额) + 百分比
+function windowRow(o, { y, badge, reset, percent, delta, amount }) {
+  let x = 0;
+  if (badge) x = drawBadge(o, x, y, badge);
+  x = drawStr(o, x, y, reset);
+  if (delta !== undefined) {
+    const dx = x + 4;
+    el(o, 'tri', `left:${dx * S}px;top:${(y - 7) * S}px;
+      border-left:${3 * S}px solid transparent;border-right:${3 * S}px solid transparent;
+      border-bottom:${7 * S}px solid #d8f3ff;`);
+    drawStr(o, dx + 9, y, delta);
+    const pct = el(o, 'ch', `left:${(W - percent.length * CW) * S}px;top:${(y - 11) * S}px`);
+    pct.textContent = percent;
+    return;
+  }
+  // 充值额度模式：百分比跟在重置时间后面（空一格），金额贴右
+  x = drawStr(o, x + CW, y, percent);
+  if (amount !== undefined) {
+    const a = el(o, 'ch', `left:${(W - amount.length * CW) * S}px;top:${(y - 11) * S}px`);
+    a.textContent = amount;
+  }
+}
+
+function balanceRow(o, y, label, value) {
+  drawStr(o, 0, y, label);
+  const v = el(o, 'ch', `left:${(W - value.length * CW) * S}px;top:${(y - 11) * S}px`);
+  v.textContent = value;
+}
+
+function card(title, tag, cfg, painter, note) {
+  const wrap = el(grid, 'card');
+  wrap.innerHTML = `<h2>${title}${tag ? `<span class="tag">${tag}</span>` : ''}</h2>
+    <div class="cfg">${cfg}</div>`;
+  const body = el(wrap, 'oled');
+  painter(body, wrap);
+  if (note) {
+    const p = el(wrap, 'note');
+    p.innerHTML = note;
+  }
+}
+
+card('目标：默认三行，窗口行带徽标', '3 行', 'rows = chatgpt:7d,deepseek,openrouter',
+  (o) => {
+    windowRow(o, { y: 20, badge: 'O', reset: '[3d]', delta: '-4h', percent: '40%' });
+    balanceRow(o, 36, 'deepseek', '12.34');
+    balanceRow(o, 52, 'openrouter', '56.78');
+  },
+  '第一行比原来多 13px 前缀，重置倒计时、Δ、百分比之间的相对位置完全没变。余额行一字未动。');
+
+card('现状（对照）', '无徽标', '同一配置，当前固件',
+  (o) => {
+    windowRow(o, { y: 20, reset: '[3d]', delta: '-4h', percent: '40%' });
+    balanceRow(o, 36, 'deepseek', '12.34');
+    balanceRow(o, 52, 'openrouter', '56.78');
+  },
+  '现在屏幕上的样子，用来对比徽标占掉的宽度。');
+
+card('Antigravity：7d 额度正常', '新来源', 'rows = antigravity:7d,deepseek,openrouter',
+  (o) => {
+    windowRow(o, { y: 20, badge: 'G', reset: '[5d]', delta: '+1h', percent: '63%' });
+    balanceRow(o, 36, 'deepseek', '12.34');
+    balanceRow(o, 52, 'openrouter', '56.78');
+  },
+  '还有 63% 额度时，和 ChatGPT / Claude 的窗口行同一个版式。');
+
+card('Antigravity：额度耗尽，转充值余额', '切换态', 'rows = antigravity:7d,…（Gemini 7d 已用尽）',
+  (o) => {
+    windowRow(o, { y: 20, badge: 'G', reset: '[5d]', percent: '0%', amount: '12.34' });
+    balanceRow(o, 36, 'deepseek', '12.34');
+    balanceRow(o, 52, 'openrouter', '56.78');
+  },
+  '就是你说的 <code>[G] [5d] 0%    xxx.xx</code>：Δ 不画（额度用尽，配速没意义），百分比跟在重置时间后面，充值余额贴右。12.34 由 credits ÷ 100 得到，不带 $。');
+
+card('Antigravity：耗尽且无充值余额', '保守态', '同一配置，接口没给 availableCredits',
+  (o) => {
+    windowRow(o, { y: 20, badge: 'G', reset: '[5d]', percent: '0%', amount: '--' });
+    balanceRow(o, 36, 'deepseek', '12.34');
+    balanceRow(o, 52, 'openrouter', '56.78');
+  },
+  '非 Pro/Ultra 账号没有 credit 字段，或那次响应没带：显示 <code>--</code>，不编造 0.00。');
+
+card('Claude 也带徽标', '保留能力', 'rows = claude:7d,deepseek',
+  (o) => {
+    windowRow(o, { y: 28, badge: 'A', reset: '[6d]', delta: '-2h', percent: '41%' });
+    balanceRow(o, 44, 'deepseek', '12.34');
+  },
+  'Claude 目前不在默认配置里，加回 <code>claude:7d</code> 时同样显示 [A]。两行仍然居中（28 / 44）。');
+
+card('一屏三个来源时的混合', '混合', 'rows = chatgpt:7d,antigravity:7d,deepseek',
+  (o) => {
+    windowRow(o, { y: 20, badge: 'O', reset: '[3d]', delta: '-4h', percent: '40%' });
+    windowRow(o, { y: 36, badge: 'G', reset: '[5d]', percent: '0%', amount: '12.34' });
+    balanceRow(o, 52, 'deepseek', '12.34');
+  },
+  '两个窗口行各带自己的字母；余额行没有徽标，也不会因为别的行有徽标而缩进。');
+
+card('徽标尺寸（放大 8 倍）', '尺寸', 'badge = 9×12 px，字母用 7×14 字体镂空',
+  (o, wrap) => {
+    wrap.removeChild(o);
+    const z = el(wrap, 'zoom');
+    const box = el(z, 'badge', 'left:64px;top:72px;width:72px;height:88px;border-radius:4px');
+    const g = el(box, 'ch', 'left:8px;top:-8px;width:56px;height:112px;line-height:112px;font-size:70px');
+    g.textContent = 'G';
+    const p = el(z, 'note', 'position:absolute;left:12px;top:12px;max-width:340px;color:#9aa3b2');
+    p.innerHTML = '白块 9×12，字母 7×14 居中；上下各留 1px 白边，与正文大写字母同高。';
+  },
+  '三个徽标方块完全一样大，只是字母不同；因为 7×14 是等宽字体，G / O / A 的宽度一致。');
+</script>
+</body>
+</html>
