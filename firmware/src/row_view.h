@@ -99,6 +99,87 @@ inline bool showStatusView(bool hasError, bool hasData, uint8_t phase) {
   return !hasData || phase == 2;
 }
 
+// 窗口行（视图 1）的横向排版。所有窗口行固定 7×14 字体，ASCII 前进 7px。
+// 普通形态：`[徽标] [3d] Δ 配速 … 百分比`，百分比贴右。
+// 充值形态（Antigravity 额度用尽/余额不足）：`[徽标] [5d] 0% … 金额`，不再画配速。
+constexpr int16_t kRowWidth = 128;
+constexpr int16_t kWindowCharWidth = 7;
+constexpr int16_t kBadgeWidth = 9;      // 反色块本身
+// 高度 12：向上多补 1px，让字母上下各留 1px 白边（7×14 的大写墨迹是 baseline-10…baseline-1）。
+constexpr int16_t kBadgeHeight = 12;
+constexpr int16_t kBadgeGap = 4;        // 块与重置时间之间
+constexpr int16_t kBadgeAdvance = kBadgeWidth + kBadgeGap;
+constexpr int16_t kDeltaGap = 4;        // 重置时间与 Δ 之间
+constexpr int16_t kDeltaTextOffset = 9; // Δ 起点到配速文字的偏移
+constexpr int16_t kCreditGap = 2;       // 百分比与金额之间至少留的距离
+
+struct WindowRowLayout {
+  bool showBadge = false;
+  bool showReset = false;
+  bool showPercent = false;
+  bool showDelta = false;
+  bool showAmount = false;
+  int16_t badgeX = 0;
+  int16_t resetX = 0;
+  int16_t deltaGlyphX = 0;
+  int16_t deltaTextX = 0;
+  int16_t percentX = 0;
+  int16_t amountX = 0;
+};
+
+// creditMode 为 true 时画金额而不是配速：百分比紧跟重置时间，金额贴右。
+// 金额是这一形态的信息主体，始终保留；挤不下时先去掉空格再去掉百分比。
+// 普通形态里配速放不下时整组让位（而不是压到百分比上）。
+inline WindowRowLayout windowRowLayout(bool hasBadge, int16_t resetWidth, int16_t percentWidth,
+                                       int16_t deltaWidth, int16_t amountWidth,
+                                       bool creditMode) {
+  WindowRowLayout layout{};
+  layout.showBadge = hasBadge;
+  int16_t x = hasBadge ? kBadgeAdvance : 0;
+  layout.resetX = x;
+  layout.showReset = true;
+  x = static_cast<int16_t>(x + resetWidth);
+  if (creditMode) {
+    const int16_t amountX = static_cast<int16_t>(kRowWidth - amountWidth);
+    int16_t percentX = static_cast<int16_t>(x + kWindowCharWidth);
+    bool showPercent = percentWidth > 0;
+    if (showPercent && percentX + percentWidth + kCreditGap > amountX) {
+      percentX = x;
+    }
+    if (showPercent && percentX + percentWidth + kCreditGap > amountX) {
+      showPercent = false;
+    }
+    bool showReset = true;
+    bool showBadge = hasBadge;
+    // 极端宽的金额（远超实际量级）连重置时间都放不下时，保留金额——
+    // 它是充值形态的信息主体——把重置时间让掉，而不是留一片空白。
+    if (amountWidth > 0 && amountX < layout.resetX + resetWidth + kCreditGap) {
+      showReset = false;
+      showPercent = false;
+      percentX = 0;
+    }
+    // 金额再宽到会压住徽标时，徽标也让位（金额优先）。
+    if (amountWidth > 0 && amountX < (showReset ? 0 : kBadgeAdvance)) {
+      showBadge = false;
+    }
+    layout.showBadge = showBadge;
+    layout.showReset = showReset;
+    layout.showPercent = showPercent;
+    layout.percentX = percentX;
+    layout.amountX = amountX > 0 ? amountX : 0;
+    // 比整行还宽的金额放不下：明确不画，而不是画到屏幕左边外面去。
+    layout.showAmount = amountWidth > 0 && amountWidth <= kRowWidth;
+    return layout;
+  }
+  layout.showPercent = percentWidth > 0;
+  layout.percentX = static_cast<int16_t>(kRowWidth - percentWidth);
+  layout.deltaGlyphX = static_cast<int16_t>(x + kDeltaGap);
+  layout.deltaTextX = static_cast<int16_t>(layout.deltaGlyphX + kDeltaTextOffset);
+  layout.showDelta = deltaWidth > 0 &&
+                     layout.deltaTextX + deltaWidth <= layout.percentX - 1;
+  return layout;
+}
+
 // 视图 2 的横向排版：状态词贴右，其余元素贴左，彼此不重叠也不越过整行宽度。
 // 宽度一律以像素传入（ASCII 6px、中文 12px）。放不下时按
 // 平台名 → * → 过期时间 的顺序依次让位，状态词永远完整。

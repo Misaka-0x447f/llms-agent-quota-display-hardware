@@ -27,15 +27,18 @@ PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -e esp32c3_supermini -t
   --upload-port /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_*-if00
 ```
 
-串口为 115200 baud。固件使用 NVS 明文保存 Wi-Fi、ChatGPT（Codex）、Claude 和
-各平台余额凭据；当前阶段没有启用 ESP32 Flash Encryption。默认显示 ChatGPT 7 天
+串口为 115200 baud。固件使用 NVS 明文保存 Wi-Fi、ChatGPT（Codex）、Claude、
+Antigravity 和各平台余额凭据；Antigravity 的 Google OAuth client id/secret 不写进
+仓库，构建前由 `scripts/gen_antigravity_client.py` 从 `cli/antigravity-client.json`
+（gitignore）或环境变量生成 `src/antigravity_client.h`；当前阶段没有启用 ESP32 Flash Encryption。默认显示 ChatGPT 7 天
 额度、DeepSeek 和 OpenRouter 余额；Claude 凭据存入独立的 `claude_auth` NVS 值，
 不复用旧令牌。
 每个平台最多 4 个 API key，多个余额在屏幕上用 `+` 拼接，2 个及以上时每个
 金额保留一位小数；单个 key 仍保留两位小数。
 
 默认固件使用 `pnpm --dir cli codex-quota-device login --provider chatgpt` 授权；
-`claude` 仍可用，只是默认不显示。
+`claude` 与 `antigravity` 也支持，只是默认不显示。Antigravity 只取 Gemini 的每周
+额度，额度用尽后改为显示充值余额（credits ÷ 100，单位美元）。
 
 正在抓取的行会在该行下面显示 1px 的进度条，线在行基线 +2（ink 下界见
 `scripts/font_ink_probe.c`，实测本行最低像素是基线 +1）。WiFi 重连阶段（最长
@@ -48,12 +51,15 @@ PLATFORMIO_CORE_DIR="$PWD/.pio-core" pio run -d firmware -e esp32c3_supermini -t
 `fetchingMask`，排队中的行没有线。
 
 电脑退出后，ESP32 自己请求用量及续期。屏幕显示哪些行、顺序、窗口和刷新间隔
-由 NVS 的 `rows` 决定，默认 `chatgpt:7d,deepseek,openrouter`（最多 3 行，
+由 NVS 的 `rows` 决定，默认 `chatgpt:7d,deepseek,openrouter`（最多 4 行，
+来源可选 `chatgpt` / `claude` / `antigravity` / `deepseek` / `openrouter`，
 未列出的来源不抓取也不上屏）。没有单独的底部状态行，出错时该行每 2 秒在数据
-与「过期时间 + 状态词」之间切换，各行共用同一相位；行数少于 3 时整体居中。
+与「过期时间 + 状态词」之间切换，各行共用同一相位；行数少于 3 时整体居中；4 行时行距压到 14px（基线 15/29/43/57）。
 默认窗口类每 10 分钟抓一次、余额每 50 秒抓一次，每行可用 `@30s` / `@5m` 覆盖，
-同一来源占多行时取最短；各来源独立排队。5 小时窗口只在写进 `rows` 时才显示。
-ChatGPT 与 Claude 的凭据都按单个 NVS 值保存，续期前先写「进行中」状态。
+同一来源占多行时取最短；各来源独立排队。5 小时窗口只在写进 `rows` 时才显示（`antigravity` 只有 7d）。
+窗口行最左侧有一个反色小方块（9×11），只放一个字母：ChatGPT `O`、Antigravity `G`、
+Claude `A`；余额行没有。
+ChatGPT、Claude 与 Antigravity 的凭据都按单个 NVS 值保存，续期前先写「进行中」状态。
 首次授权与设备续期都成功后，才算验证了独立运行能力。`login` 成功仅确认串口
 写入，不确认上游接口可用。
 
@@ -71,6 +77,28 @@ NVS 在续期前记录进行中状态，成功后一次写入新令牌对及过�
 
 HTTPS 使用 `data/cert/x509_crt_bundle.bin` 中嵌入的根证书集合校验服务端证书，
 没有使用 `setInsecure()`。
+
+## 窗口行的电脑端渲染
+
+`scripts/render_rows_host.cpp` 用固件里同一份 `src/window_render.h` 把 128×64 画面
+画进内存缓冲区（U8g2 的 C API，输出端是空实现），用来在没有实物设备时核对
+徽标、`Δ` 和充值余额的排版：
+
+```bash
+U8G2=.pio/libdeps/esp32c3_supermini/U8g2/src/clib
+CJ=.pio/libdeps/protocol_native/cJSON          # 渲染器会调用 antigravity::overageMode
+gcc -std=c++11 -O1 -I "$U8G2" -I "$CJ" -I src -o /tmp/render_rows scripts/render_rows_host.cpp \
+  "$U8G2"/u8g2_setup.c "$U8G2"/u8g2_buffer.c "$U8G2"/u8g2_font.c "$U8G2"/u8g2_fonts.c \
+  "$U8G2"/u8g2_hvline.c "$U8G2"/u8g2_ll_hvline.c "$U8G2"/u8g2_box.c "$U8G2"/u8g2_circle.c \
+  "$U8G2"/u8g2_line.c "$U8G2"/u8g2_intersection.c "$U8G2"/u8g2_kerning.c \
+  "$U8G2"/u8x8_setup.c "$U8G2"/u8x8_display.c "$U8G2"/u8x8_8x8.c "$U8G2"/u8x8_gpio.c \
+  "$U8G2"/u8x8_u16toa.c "$U8G2"/u8x8_cad.c "$U8G2"/u8x8_byte.c \
+  "$U8G2"/u8x8_capture.c "$U8G2"/u8x8_d_ssd1306_128x64_noname.c "$CJ"/cJSON.c -lm
+mkdir -p /tmp/rows
+/tmp/render_rows /tmp/rows   # 输出 .pbm（P4）；目录不可写时报错并返回 1
+# 四行场景的基线取自固件的 rowLayout(4)；低余额场景会断言 overageMode 的现行规则，
+# 如果 73% 剩余被切成金额形态，脚本会以非零退出并报错。
+```
 
 ## 中文字形
 

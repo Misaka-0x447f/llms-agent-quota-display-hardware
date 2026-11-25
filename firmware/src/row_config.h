@@ -8,10 +8,12 @@
 #include "refresh_plan.h"
 
 namespace quota {
-// 屏幕最多 3 行；每行由一个「来源 + 窗口」描述，顺序即行序。
+// 屏幕最多 4 行；每行由一个「来源 + 窗口」描述，顺序即行序。
+// 4 行时行距压到 14px（1～3 行仍用 16px），否则 64px 高度放不下第四行。
 enum class RowSource : uint8_t {
   kChatgpt,
   kClaude,
+  kAntigravity,
   kDeepseek,
   kOpenrouter,
 };
@@ -21,7 +23,7 @@ enum class WindowKind : uint8_t {
   kFiveHour,
 };
 
-constexpr size_t kMaxRows = 3;
+constexpr size_t kMaxRows = 4;
 constexpr char kDefaultRows[] = "chatgpt:7d,deepseek,openrouter";
 
 // 每行可以单独用 `@5m` / `@30s` 覆盖默认节奏（窗口 10 分钟、余额 50 秒，见 refresh_plan.h）。
@@ -30,11 +32,17 @@ constexpr uint32_t kMaxRefreshSeconds = 24 * 3600;
 
 struct RowConfig {
   RowSource source;
-  WindowKind window;  // 只对 chatgpt/claude 有意义，余额行固定填 kSevenDay。
+  WindowKind window;  // 只对窗口行有意义（antigravity 只有 7d），余额行固定填 kSevenDay。
   uint32_t intervalSeconds;  // 已解析好的刷新间隔（默认值也会填进来）。
 };
 
 inline bool isWindowSource(RowSource source) {
+  return source == RowSource::kChatgpt || source == RowSource::kClaude ||
+         source == RowSource::kAntigravity;
+}
+
+// Antigravity 只取每周额度（用户 2026-11-25），不接受 5h。
+inline bool supportsFiveHour(RowSource source) {
   return source == RowSource::kChatgpt || source == RowSource::kClaude;
 }
 
@@ -42,10 +50,26 @@ inline const char* rowSourceName(RowSource source) {
   switch (source) {
     case RowSource::kChatgpt: return "chatgpt";
     case RowSource::kClaude: return "claude";
+    case RowSource::kAntigravity: return "antigravity";
     case RowSource::kDeepseek: return "deepseek";
     case RowSource::kOpenrouter: return "openrouter";
   }
   return "";
+}
+
+// 窗口行重置时间前面的反色小徽标，只容纳一个字母：按厂商取首字母。
+// 余额行没有徽标（返回 nullptr）。ChatGPT → OpenAI；Antigravity 的额度来自
+// Google 的 Gemini 模型组；Claude → Anthropic。
+inline const char* rowBadgeLetter(RowSource source) {
+  switch (source) {
+    case RowSource::kChatgpt: return "O";
+    case RowSource::kAntigravity: return "G";
+    case RowSource::kClaude: return "A";
+    case RowSource::kDeepseek:
+    case RowSource::kOpenrouter:
+      return nullptr;
+  }
+  return nullptr;
 }
 
 inline const char* windowSuffix(WindowKind window) {
@@ -95,6 +119,7 @@ inline bool parseSource(const char* name, size_t length, RowSource& source) {
   static const Entry entries[] = {
       {"chatgpt", RowSource::kChatgpt},
       {"claude", RowSource::kClaude},
+      {"antigravity", RowSource::kAntigravity},
       {"deepseek", RowSource::kDeepseek},
       {"openrouter", RowSource::kOpenrouter},
   };
@@ -107,8 +132,8 @@ inline bool parseSource(const char* name, size_t length, RowSource& source) {
   return false;
 }
 
-// 语法：`source[:window][@interval]`，逗号分隔，最多 3 项，忽略各项两侧的空格。
-// 窗口只接受 7d / 5h 且只能跟在 chatgpt / claude 后面；余额行写窗口视为错误。
+// 语法：`source[:window][@interval]`，逗号分隔，最多 4 项，忽略各项两侧的空格。
+// 窗口只接受 7d / 5h 且只能跟在窗口行后面；antigravity 只接受 7d；余额行写窗口视为错误。
 // 间隔形如 `@5m` / `@30s`，省略时按来源取默认值（窗口 10 分钟、余额 50 秒）。
 // 解析是全有或全无的：任一项非法就返回 false，不留下半份配置。
 inline bool parseRows(const char* text, size_t length, RowConfig* out, size_t& count) {
@@ -148,6 +173,8 @@ inline bool parseRows(const char* text, size_t length, RowConfig* out, size_t& c
       const char* suffix = colon + 1;
       const size_t suffixLength = tokenLength - nameLength - 1;
       if (suffixLength == 2 && strncmp(suffix, "5h", 2) == 0) {
+        // Antigravity 只有每周额度：写 5h 是配置错误，不能悄悄当成 7d。
+        if (!supportsFiveHour(source)) return false;
         window = WindowKind::kFiveHour;
       } else if (!(suffixLength == 2 && strncmp(suffix, "7d", 2) == 0)) {
         return false;
@@ -226,13 +253,17 @@ struct RowSlotLayout {
 };
 
 // 行数少于 3 时整体居中：3 行 20/36/52，2 行 28/44，1 行 36；行距保持 16px。
+// 4 行时行距 14px：15/29/43/57。
 // 每条线落在独立的 8px 页里，动画刷新一次只发一页。
 inline bool rowLayout(size_t count, RowSlotLayout* out) {
   if (out == nullptr || count == 0 || count > kMaxRows) return false;
+  // 4 行：行距 14px，整体居中（首行墨迹从 y=4 开始）；1～3 行仍用 16px 行距。
+  static const int16_t kFour[] = {15, 29, 43, 57};
   static const int16_t kThree[] = {20, 36, 52};
   static const int16_t kTwo[] = {28, 44};
   static const int16_t kOne[] = {36};
-  const int16_t* baselines = count == 3 ? kThree : count == 2 ? kTwo : kOne;
+  const int16_t* baselines =
+      count == 4 ? kFour : count == 3 ? kThree : count == 2 ? kTwo : kOne;
   for (size_t i = 0; i < count; ++i) {
     out[i].textY = baselines[i];
     out[i].lineY = static_cast<int16_t>(baselines[i] + kLoadingLineOffset);

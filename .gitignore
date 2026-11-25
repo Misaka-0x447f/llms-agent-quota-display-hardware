@@ -10,3 +10,10 @@ coverage/
 # Device-local configuration and credentials.
 device-config.json
 *.credentials.json
+
+# Local screenshot scratch area.
+.shots/
+
+# Local Antigravity Google OAuth client (injected at build/login time, never committed).
+cli/antigravity-client.json
+firmware/src/antigravity_client.h

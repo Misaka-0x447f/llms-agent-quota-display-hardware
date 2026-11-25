@@ -6,7 +6,7 @@
 DeepSeek 和 OpenRouter 余额，三行铺满整屏，没有单独的底部状态行。例如（示意数值）：
 
 ```text
-[3d] Δ-4h     95%
+[O] [3d] Δ-4h 95%      ← 方框是反色徽标：O = OpenAI，G = Google，A = Anthropic
 deepseek     12.34
 openrouter   56.78
 ```
@@ -18,15 +18,18 @@ openrouter   56.78
 rows = chatgpt:7d,deepseek,openrouter        # 默认
 rows = chatgpt:7d@5m,deepseek@30s            # 每行单独设刷新间隔
 rows = chatgpt:5h,chatgpt:7d,openrouter      # 同一来源占两行（5h 有数据时）
+rows = antigravity:7d,deepseek               # Antigravity 只有每周额度
 rows = chatgpt:7d,deepseek                   # 只留两行，居中排列
 ```
 
-- 来源：`chatgpt` / `claude` / `deepseek` / `openrouter`，最多 3 行，顺序即行序。
-- `chatgpt`、`claude` 可带窗口 `:7d` 或 `:5h`（省略为 `7d`）；余额来源不写窗口。
+- 来源：`chatgpt` / `claude` / `antigravity` / `deepseek` / `openrouter`，最多 4 行，顺序即行序。
+- `chatgpt`、`claude` 可带窗口 `:7d` 或 `:5h`（省略为 `7d`）；`antigravity` 只有
+  每周额度，只接受 `:7d`；余额来源不写窗口。
 - 每行可用 `@间隔` 覆盖默认节奏：`30s` / `5m` / `1h`，范围 10 秒～24 小时。
   默认窗口类 10 分钟、余额类 50 秒；同一来源占多行时取其中最短的间隔。
 - 没列出的来源**不排队、不抓取、不上屏**，凭据仍保留在设备里。
-- 行数少于 3 时整体居中（2 行在 28/44 基线，1 行在 36）。
+- 行数少于 3 时整体居中（2 行在 28/44 基线，1 行在 36）；4 行时行距压到 14px
+  （基线 15/29/43/57），64px 高度才放得下第四行。
 
 每一行都有两个视图，各行同步轮换（每个视图停留 2 秒，一轮 4 秒）：
 
@@ -41,8 +44,8 @@ rows = chatgpt:7d,deepseek                   # 只留两行，居中排列
 整小时/整天整除的用对应单位（`<10m`、`12m`、`<1h`、`2h`、`<1d`）；不能整除的
 （例如 `@90s`）退回秒，避免写出 `<1m` 这种不成立的阈值。
 
-窗口行（ChatGPT / Claude）左侧将重置倒计时和 Δ 组成一组，剩余百分比独立贴右
-对齐。ChatGPT 和 Claude 的 5 小时窗口都会解析；要在屏幕上显示，就把
+窗口行（ChatGPT / Claude / Antigravity）左侧将重置倒计时和 Δ 组成一组，剩余百分比
+独立贴右对齐。ChatGPT 和 Claude 的 5 小时窗口都会解析；要在屏幕上显示，就把
 `chatgpt:5h` 或 `claude:5h` 写进行配置。
 平台全名默认使用 6×12 字体左对齐，显示 2 个及以上余额时改用 5×8 字体；
 金额使用 7×14 字体，不显示单位，统一右对齐。
@@ -67,9 +70,10 @@ pnpm --dir cli codex-quota-device login --provider chatgpt
 pnpm --dir cli codex-quota-device update --rows "chatgpt:7d,deepseek,openrouter"
 ```
 
-已有 Wi-Fi、Claude、ChatGPT、DeepSeek、OpenRouter 凭据均保留，切换固件无需
-清空配置。注意默认 `rows` 不含 Claude：只跑 `login --provider claude` 的旧设备
-升级后，要么把 `claude:7d` 加进 `rows`，要么登录 ChatGPT，否则没有可抓取的行。
+已有 Wi-Fi、Claude、ChatGPT、Antigravity、DeepSeek、OpenRouter 凭据均保留，
+切换固件无需清空配置。注意默认 `rows` 只含 `chatgpt:7d,deepseek,openrouter`：
+只登录了 Claude 或 Antigravity 的设备，要把 `claude:7d` / `antigravity:7d`
+加进 `rows`，否则没有可抓取的行。
 `login` 默认 Claude，`--provider chatgpt`（兼容别名 `codex`）走 ChatGPT 的
 OAuth；`list` 返回 `rows` 回显当前行配置，以及
 `deepseek_balance`、`openrouter_balance` 的余额、币种及过期标记。
@@ -82,15 +86,16 @@ ESP32-C3 SuperMini + 128×64 I²C OLED 的个人订阅额度显示器。电脑�
 OAuth 授权、重新登录和配置；正常运行时由 ESP32 自己通过 Wi-Fi 请求用量接口并
 续期，不需要电脑常驻程序或中转服务器。
 
-屏幕最多三行，显示哪些行由 `rows` 决定；下面是默认配置（数值仅为布局示意）：
+屏幕最多四行，显示哪些行由 `rows` 决定；下面是默认配置（数值仅为布局示意）：
 
 ```text
-[3d] Δ-4h     95%
+[O] [3d] Δ-4h 95%
 deepseek     12.34
 openrouter   56.78
 ```
 
 - 第一行：ChatGPT 7 天窗口，行首方括号显示距重置的剩余时间，右侧是剩余百分比，中间是配速 `Δ`。
+- 最多 4 行；4 行时行距从 16px 压到 14px（loading 线离下一行文字只有 1px）。
 - 第二、三行：DeepSeek 和 OpenRouter 余额。
 - 换成 `claude:7d` 或 `chatgpt:5h` 时版式相同，只是数据来源/窗口不同。
 - 某一行出错时，该行每 2 秒在数据与「过期时间 + 状态词」之间切换一次，
@@ -114,6 +119,29 @@ ChatGPT 和 Claude 的 5 小时窗口都会解析，并出现在 `list` 的 `cha
 当 Δ 在 −1 小时到 +1 小时之间（含边界），固定以 5 分钟为步长四舍五入：
 `+3m → +5m`、`−3m → −5m`，半档 `±2m30s → ±5m`；舍入为零统一显示
 `+0m`，边界显示 `±60m`。超过 1 小时沿用原有小时/天格式。
+窗口行最左边有一个反色小方块徽标，只容纳一个字母，提示这一行是哪家额度：
+
+| 来源 | 徽标 | 字母来源 |
+| --- | --- | --- |
+| `chatgpt` | `O` | OpenAI |
+| `antigravity` | `G` | Google / Gemini |
+| `claude` | `A` | Anthropic |
+
+方块 9×12 px，字母镂空（反色）、上下各留 1px 白边，位于重置时间左侧；
+重置时间因此整体右移 13px。
+余额行（`deepseek` / `openrouter`）没有徽标。
+
+Antigravity 行的额度用尽（剩余 0%）时，这一行改显示充值余额，不再画配速
+（余额低于 minimum **不会**触发切换：那会让没买 credits 的账号永远看不到配速）：
+
+```text
+[G] [5d] 0%    12.34
+```
+
+余额来自 `loadCodeAssist` 的 `availableCredits`（`GOOGLE_ONE_AI`），按
+**100 credits = 1 美元** 换算，两位小数、不带 `$`。拿不到余额时右侧显示 `--`，
+不把「没有数据」写成 `0.00`。
+
 额度本身不使用进度条（屏幕上唯一的线是抓取时那条 1px loading）。
 7 天额度行复用原版额度行布局，整行固定 7×14 字体；百分比与 Δ
 间隔 4 像素，Δ 后文字从其起点右移 9 像素绘制，不自动缩小字体。
@@ -129,9 +157,9 @@ ChatGPT 和 Claude 的 5 小时窗口都会解析，并出现在 `list` 的 `cha
 1. 按 [firmware/README.md](firmware/README.md) 构建并烧录固件。
 2. 安装 CLI 依赖。命令名 `codex-quota-device` 保留以兼容已有使用方式。
 3. 配置 Wi-Fi；已有配置可以直接沿用。
-4. 运行 `login --provider chatgpt`（或 `claude`），在电脑浏览器中为设备单独授权。
-   选 `claude` 时还要把 `claude:7d` 写进 `rows`（默认配置里没有 Claude），否则设备
-   没有可抓取的行、会显示未配置。
+4. 运行 `login --provider chatgpt`（或 `claude` / `antigravity`），在电脑浏览器中为设备单独授权。
+   选 `claude` / `antigravity` 时还要把 `claude:7d` / `antigravity:7d` 写进 `rows`
+   （默认配置里没有它们），否则设备没有可抓取的行、会显示未配置。
 
 ```bash
 pnpm --dir cli install
@@ -164,7 +192,8 @@ pnpm --dir cli codex-quota-device update \
 继续更新。`list` 的 `deepseek_balances`、`openrouter_balances` 数组逐项给出
 每个 key 的 `remaining`、`stale` 和币种（不返回 key 本身）。
 
-Claude 用 `login --provider claude`，ChatGPT 用 `login --provider chatgpt`。
+Claude 用 `login --provider claude`，ChatGPT 用 `login --provider chatgpt`，
+Antigravity 用 `login --provider antigravity`（Google 账号，授权后才能读 Gemini 额度）。
 CLI 发起独立的 OAuth 授权，不读取电脑上 Claude Code / Codex CLI 的凭据。浏览器回调地址是 `http://localhost:54545/callback`；无法自动回跳时，
 可在 CLI 中粘贴完整回调 URL。可使用 `--no-browser` 自行打开授权页。
 
@@ -191,10 +220,14 @@ pnpm --dir cli codex-quota-device erase
 `list` 返回 `rows`（当前行配置的回显，每行都带该行配置的 `@间隔`；同一来源占
 多行时实际抓取取其中最短的）、是否已配置、是否需要登录、令牌过期
 时间、接口冷却截止时间和两档用量（`chatgpt_five_hour` / `chatgpt_seven_day`、
-`five_hour` / `seven_day`），不返回凭据；`usage_provider` 仍固定返回 `claude`
+`five_hour` / `seven_day` / `antigravity_seven_day`），不返回凭据；
+Antigravity 还回显 `antigravity_configured`、`antigravity_plan`（原始档位名）、
+`antigravity_credits`（`present`/`amount`/`minimum`，已换算成美元）和
+`antigravity_overage`（当前是否已切换到显示余额，`antigravity_account` 是登录邮箱）；`usage_provider` 仍固定返回 `claude`
 （旧 CLI 兼容字段），行配置以 `rows` 为准。注意串口里的 `used_percent` 是
 **已用**百分比，屏幕是**剩余**百分比；`reset_at` 是 Unix 秒。
-`chatgpt_status`、`claude_status`、`deepseek_status`、`openrouter_status` 分别
+`chatgpt_status`、`claude_status`、`antigravity_status`、`deepseek_status`、
+`openrouter_status` 分别
 给出每一行在屏幕上的状态（未列进 `rows` 的来源不回显轮询状态）：
 `state` 是状态词（与视图 2 右侧一致），`error_detail` 是错误详情，
 `age_seconds` 是过期时间（`-1` 表示这一行还没有过成功记录，`0` 才是刚成功过），
@@ -209,7 +242,7 @@ pnpm --dir cli codex-quota-device erase
 顶层 `state` 是「第一个异常行的状态」，`last_refresh` 是任一来源最近一次成功
 抓取的 Unix 时间，每行自己的新鲜度看 `*_status.age_seconds`。
 
-两套 OAuth 都按同一套保护处理：抓取前检查访问令牌，距过期不足 120 秒时先续期，
+三套 OAuth（Claude / ChatGPT / Antigravity）都按同一套保护处理：抓取前检查访问令牌，距过期不足 120 秒时先续期，
 用量接口返回 401 时最多续期一次；续期前先把「进行中」状态落盘，成功后把新的
 access/refresh/expires 作为单个 NVS 值一次写入。断电或网络中断导致结果不确定时，
 设备停止自动重放该刷新令牌，显示「登录失效」，需要再次运行 `login`。
@@ -226,7 +259,8 @@ Claude 的 429 至少等待 5 分钟，并遵守更长的 `Retry-After`；ChatGP
 截止时间——时钟还没就绪时按「没有冷却」处理，避免一个过去的截止时间把重试排到
 几天以后。失败只影响出错的那一行，其他行按自己的节奏继续刷新。401/403 持续
 失败或续期结果不确定时停止自动续期，`list` 中对应来源的
-`claude_needs_login` / `chatgpt_needs_login` 为 `true`。
+`claude_needs_login` / `chatgpt_needs_login` / `antigravity_needs_login` 为 `true`
+（`*_pending` 表示「进行中」状态还没确认）。
 
 ## 接口与验证边界
 
@@ -244,6 +278,44 @@ ChatGPT（Codex CLI 的用量接口）：
 - 请求携带 `Authorization: Bearer` 与 `Chatgpt-Account-Id`；响应
   `rate_limit.primary_window` / `secondary_window` 按 `limit_window_seconds`
   区分 5 小时和 7 天窗口。
+
+Antigravity（Google Cloud Code，与 `agy` 同一套只读接口）：
+
+- **客户端配置不在仓库里**：Antigravity 的 Google OAuth client id / secret 被
+  GitHub push protection 当作 secret，所以既不进源码也不进提交。首次使用前复制
+  `cli/antigravity-client.example.json` 为 `cli/antigravity-client.json` 并填入真值，
+  或设置环境变量 `ANTIGRAVITY_CLIENT_ID` / `ANTIGRAVITY_CLIENT_SECRET`。固件构建时由
+  `firmware/scripts/gen_antigravity_client.py` 从同一来源生成
+  `firmware/src/antigravity_client.h`（同样在 `.gitignore` 里）；没有配置时设备会报
+  「Antigravity 客户端未配置」，不会发出空 client_id 的请求。
+
+- 授权：`https://accounts.google.com/o/oauth2/v2/auth`（回环重定向
+  `http://localhost:54545/callback`），续期 `https://oauth2.googleapis.com/token`
+- 配额：`POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
+- 档位与充值余额：`POST .../v1internal:loadCodeAssist`
+- 两个接口都带 `Authorization: Bearer`，并且**必须带对 User-Agent**。实测（2026-11-25，
+  真实账号）：只有 `antigravity/hub/2.23.0 windows/amd64` 会返回完整的
+  `gemini-weekly` / `gemini-5h` / `3p-weekly` / `3p-5h` 四个桶；纯 `antigravity`、
+  `antigravity/1.15.7` 只返回 `3p-*`（Claude/GPT）组，`agy` 或 node 客户端 UA 会被
+  `loadCodeAssist` 判成 `UNSUPPORTED_CLIENT`。请求体是 `{}`（有 project 时带
+  `{"project": …}`）。
+- 配额响应按 `groups[].buckets[].bucketId` 取 `gemini-weekly`；`remainingFraction`
+  是**剩余**比例，`resetTime` 是 RFC3339。只有 `resetTime` 没有比例的桶表示已耗尽。
+- 本产品只读取每周（7 天）额度：上游还有 5 小时桶（`gemini-5h`），这里不读也不用。
+- 只认精确的 `bucketId = gemini-weekly`：分模型/分档位的周桶（如
+  `gemini-4-argon-weekly`）不当作 Gemini 组额度。
+- daily 与 prod 两个通道的公开证据互相矛盾（一个说 daily 缺 Gemini 组、另一个说
+  prod 会卡在过期窗口），所以配额先问 daily、缺 `gemini-weekly` 时再问 prod，
+  取能解析出的那份；只有一台主机拒绝 401/403 不算登录失效，两台都拒绝才算。
+- 充值余额以「拿到带 `GOOGLE_ONE_AI` 的响应」为准：两台主机都明确没有这一项时
+  清空上次的值（屏幕显示 `--`）；响应损坏保留旧值，超过 30 分钟没确认过才清空。
+  条目里**只有 `minimumCreditAmountForUsage` 没有 `creditAmount`** 表示余额为 0
+  （真实响应就是这样），不是坏数据。
+- 档位与余额先于配额抓取：配额失败也能在 `list` 里看到 `antigravity_plan` / 额度。
+- 切换只看周额度是否用尽：还有剩余时一律正常显示百分比和配速，余额不足也不会切换；
+  用尽后才显示余额（此时百分比自然是 0%）。
+- Google 的 installed-app 客户端**不能**用设备码（`/device/code` 返回
+  `Invalid client type`），所以和 Claude / ChatGPT 一样走浏览器回环授权。
 
 授权参数参考 [CLIProxyAPI 的 Claude 实现](https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/auth/claude/anthropic_auth.go)，
 用量结构及表单续期参考 [CodexBar 的 Claude 实现](https://github.com/steipete/CodexBar/blob/main/docs/claude.md)。
@@ -265,5 +337,6 @@ python3 firmware/scripts/sync_ui_glyphs.py --check
 ```
 
 原生协议测试在电脑上执行与固件相同的解析代码，覆盖 UTC/时区/闰日、可选窗口、
-非法响应保留旧数据及 `Retry-After`、行配置语法与布局、ChatGPT 用量窗口映射。
+非法响应保留旧数据及 `Retry-After`、行配置语法与布局、ChatGPT 用量窗口映射、
+Antigravity 的每周桶/档位/充值余额解析与徽标排版。
 测试不需要登录，也不调用上游服务。

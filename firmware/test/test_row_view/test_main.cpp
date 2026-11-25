@@ -1,4 +1,5 @@
 #include <unity.h>
+#include <initializer_list>
 #include "../../src/row_view.h"
 
 using quota::UiState;
@@ -275,6 +276,168 @@ void loading_bar_flush_handles_parts_off_screen() {
   TEST_ASSERT_EQUAL_UINT8(0, quota::loadingBarFlush(width + 1, width + 9, bar, width).count);
 }
 
+// 窗口行排版：徽标占 13px，重置时间随之右移；配速不压到百分比上。
+void window_row_layout_reserves_space_for_the_badge() {
+  quota::WindowRowLayout layout = quota::windowRowLayout(
+      true, 28, 21, 21, 0, false);  // [3d] + 95% + "-4h"
+  TEST_ASSERT_TRUE(layout.showBadge);
+  TEST_ASSERT_EQUAL_INT16(0, layout.badgeX);
+  // 徽标占 13px（9px 块 + 4px 间隔），块高 12px（向上给字母补 1px 白边）：
+  // 这些都是用户可见的固定值，不只是实现细节。
+  TEST_ASSERT_EQUAL_INT16(13, quota::kBadgeAdvance);
+  TEST_ASSERT_EQUAL_INT16(9, quota::kBadgeWidth);
+  TEST_ASSERT_EQUAL_INT16(12, quota::kBadgeHeight);
+  TEST_ASSERT_EQUAL_INT16(13, layout.resetX);
+  TEST_ASSERT_TRUE(layout.showDelta);
+  TEST_ASSERT_TRUE(layout.showPercent);
+  TEST_ASSERT_EQUAL_INT16(128 - 21, layout.percentX);
+  // Δ 与配速都在重置时间之后、百分比之前，不重叠。
+  TEST_ASSERT_TRUE(layout.deltaGlyphX > layout.resetX);
+  TEST_ASSERT_TRUE(layout.deltaTextX > layout.deltaGlyphX);
+  TEST_ASSERT_TRUE(layout.deltaTextX + 21 <= layout.percentX - 1);
+}
+
+// 没有徽标时和改动前完全一致：重置时间在 x=0。
+void window_row_layout_without_badge_starts_at_the_edge() {
+  quota::WindowRowLayout layout = quota::windowRowLayout(false, 28, 21, 21, 0, false);
+  TEST_ASSERT_FALSE(layout.showBadge);
+  TEST_ASSERT_EQUAL_INT16(0, layout.resetX);
+  TEST_ASSERT_TRUE(layout.showDelta);
+}
+
+// 配速太长时整组让位，而不是压到百分比上。
+void window_row_layout_drops_the_delta_instead_of_overlapping() {
+  quota::WindowRowLayout layout = quota::windowRowLayout(true, 28, 28, 56, 0, false);
+  TEST_ASSERT_FALSE(layout.showDelta);
+  TEST_ASSERT_TRUE(layout.showPercent);
+  TEST_ASSERT_EQUAL_INT16(128 - 28, layout.percentX);
+}
+
+// 充值形态：百分比紧跟重置时间（空一格），金额贴右，不画配速。
+void credit_mode_puts_the_amount_on_the_right() {
+  quota::WindowRowLayout layout = quota::windowRowLayout(true, 28, 14, 0, 35, true);
+  TEST_ASSERT_TRUE(layout.showPercent);
+  TEST_ASSERT_TRUE(layout.showAmount);
+  TEST_ASSERT_FALSE(layout.showDelta);
+  TEST_ASSERT_EQUAL_INT16(quota::kBadgeAdvance + 28 + quota::kWindowCharWidth,
+                          layout.percentX);
+  TEST_ASSERT_EQUAL_INT16(128 - 35, layout.amountX);
+  // 百分比与金额之间至少留 kCreditGap。
+  TEST_ASSERT_TRUE(layout.percentX + 14 + quota::kCreditGap <= layout.amountX);
+}
+
+// 金额很长时先去掉空格，再去掉百分比，金额本身始终保留。
+void credit_mode_degrades_before_dropping_the_amount() {
+  quota::WindowRowLayout tight =
+      quota::windowRowLayout(true, 28, 14, 0, 60, true);
+  TEST_ASSERT_TRUE(tight.showPercent == false ||
+                   tight.percentX + 14 + quota::kCreditGap <= tight.amountX);
+  TEST_ASSERT_TRUE(tight.showAmount);
+  TEST_ASSERT_EQUAL_INT16(128 - 60, tight.amountX);
+
+  quota::WindowRowLayout noPercent = quota::windowRowLayout(true, 28, 0, 0, 35, true);
+  TEST_ASSERT_FALSE(noPercent.showPercent);
+  TEST_ASSERT_TRUE(noPercent.showAmount);
+}
+
+// 极端宽的金额（远超实际量级）连重置时间都放不下时，明确让掉重置时间，
+// 只保留徽标与金额，而不是留一片空白。
+void credit_mode_keeps_the_amount_when_it_cannot_fit_with_the_reset() {
+  quota::WindowRowLayout layout = quota::windowRowLayout(true, 28, 14, 0, 100, true);
+  TEST_ASSERT_TRUE(layout.showAmount);
+  TEST_ASSERT_EQUAL_INT16(128 - 100, layout.amountX);
+  TEST_ASSERT_FALSE(layout.showReset);
+  TEST_ASSERT_FALSE(layout.showPercent);
+  TEST_ASSERT_TRUE(layout.showBadge);
+
+  // 实际量级（最多约 8 个字符）三者都显示。
+  quota::WindowRowLayout normal = quota::windowRowLayout(true, 28, 14, 0, 56, true);
+  TEST_ASSERT_TRUE(normal.showReset);
+  TEST_ASSERT_TRUE(normal.showPercent);
+  TEST_ASSERT_TRUE(normal.showAmount);
+}
+
+// 两个降级分支的边界：金额 65px 时百分比仍放得下（去掉空格），72px 时才让掉百分比。
+void credit_mode_degradation_boundaries_are_explicit() {
+  // reset 28 + 13 + 7 + percent 14 = 62，金额 65 → 起点 63，留不出 2px：
+  // 去掉「重置时间与百分比之间的空格」，百分比贴着重置时间。
+  quota::WindowRowLayout noSpace = quota::windowRowLayout(true, 28, 14, 0, 65, true);
+  TEST_ASSERT_TRUE(noSpace.showReset);
+  TEST_ASSERT_TRUE(noSpace.showPercent);
+  TEST_ASSERT_TRUE(noSpace.showAmount);
+  TEST_ASSERT_EQUAL_INT16(quota::kBadgeAdvance + 28, noSpace.percentX);
+  TEST_ASSERT_TRUE(noSpace.percentX + 14 + quota::kCreditGap <= noSpace.amountX);
+
+  // 72px：即使去掉空格也放不下百分比，只保留金额。
+  quota::WindowRowLayout noPercent = quota::windowRowLayout(true, 28, 14, 0, 72, true);
+  TEST_ASSERT_TRUE(noPercent.showReset);
+  TEST_ASSERT_FALSE(noPercent.showPercent);
+  TEST_ASSERT_TRUE(noPercent.showAmount);
+  TEST_ASSERT_EQUAL_INT16(128 - 72, noPercent.amountX);
+}
+
+// 金额宽到会压住徽标时徽标让位；比整行还宽时明确不画金额。
+void credit_mode_gives_the_badge_way_to_a_very_wide_amount() {
+  // 119px：金额可独占整行，重置时间与徽标都让位。
+  quota::WindowRowLayout wide = quota::windowRowLayout(true, 28, 14, 0, 119, true);
+  TEST_ASSERT_TRUE(wide.showAmount);
+  TEST_ASSERT_FALSE(wide.showReset);
+  TEST_ASSERT_FALSE(wide.showBadge);
+  TEST_ASSERT_EQUAL_INT16(128 - 119, wide.amountX);
+
+  // 126px：金额起点 2，已压到徽标，徽标必须让位。
+  quota::WindowRowLayout wider = quota::windowRowLayout(true, 28, 14, 0, 126, true);
+  TEST_ASSERT_TRUE(wider.showAmount);
+  TEST_ASSERT_FALSE(wider.showBadge);
+  TEST_ASSERT_TRUE(wider.amountX >= 0);
+
+  // 128px：正好占满整行。
+  quota::WindowRowLayout exact = quota::windowRowLayout(true, 28, 14, 0, 128, true);
+  TEST_ASSERT_TRUE(exact.showAmount);
+  TEST_ASSERT_EQUAL_INT16(0, exact.amountX);
+
+  // 129px：放不下，明确不画。
+  quota::WindowRowLayout overflow = quota::windowRowLayout(true, 28, 14, 0, 129, true);
+  TEST_ASSERT_FALSE(overflow.showAmount);
+}
+
+// 所有形态都不越出 128px：元素右边缘（含留白）应落在屏幕内。
+void window_row_layout_stays_on_screen() {
+  const int16_t resetWidths[] = {28, 35, 42};   // [3d] [12h] [123m]
+  const int16_t percents[] = {14, 21, 28};      // 9% 95% 100%
+  const int16_t deltas[] = {0, 14, 21, 35};     // -- -4h -4h -12h3m
+  const int16_t amounts[] = {0, 21, 35, 42};    // 0.00 12.34 1234.56
+  for (bool badge : {false, true}) {
+    for (int16_t reset : resetWidths) {
+      for (int16_t percent : percents) {
+        for (int16_t delta : deltas) {
+          quota::WindowRowLayout layout =
+              quota::windowRowLayout(badge, reset, percent, delta, 0, false);
+          TEST_ASSERT_TRUE(layout.resetX + reset <= 128);
+          if (layout.showPercent) {
+            TEST_ASSERT_TRUE(layout.percentX + percent <= 128);
+          }
+          if (layout.showDelta) {
+            // 实现保证配速与百分比之间至少留 1px，这里按同样的口径断言。
+            TEST_ASSERT_TRUE(layout.deltaTextX + delta <= layout.percentX - 1);
+          }
+        }
+        for (int16_t amount : amounts) {
+          quota::WindowRowLayout layout =
+              quota::windowRowLayout(badge, reset, percent, 0, amount, true);
+          if (layout.showAmount) {
+            TEST_ASSERT_TRUE(layout.amountX + amount <= 128);
+            TEST_ASSERT_TRUE(layout.amountX >= 0);
+          }
+          if (layout.showPercent && layout.showAmount) {
+            TEST_ASSERT_TRUE(layout.percentX + percent <= layout.amountX);
+          }
+        }
+      }
+    }
+  }
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(idle_states_do_not_count_as_abnormal);
@@ -293,5 +456,14 @@ int main() {
   RUN_TEST(loading_bar_full_flush_covers_both_positions);
   RUN_TEST(loading_bar_flush_handles_parts_off_screen);
   RUN_TEST(loading_bar_diff_only_flushes_the_changed_edges);
+  RUN_TEST(window_row_layout_reserves_space_for_the_badge);
+  RUN_TEST(window_row_layout_without_badge_starts_at_the_edge);
+  RUN_TEST(window_row_layout_drops_the_delta_instead_of_overlapping);
+  RUN_TEST(credit_mode_puts_the_amount_on_the_right);
+  RUN_TEST(credit_mode_degrades_before_dropping_the_amount);
+  RUN_TEST(credit_mode_keeps_the_amount_when_it_cannot_fit_with_the_reset);
+  RUN_TEST(credit_mode_gives_the_badge_way_to_a_very_wide_amount);
+  RUN_TEST(credit_mode_degradation_boundaries_are_explicit);
+  RUN_TEST(window_row_layout_stays_on_screen);
   return UNITY_END();
 }

@@ -5,7 +5,9 @@ import { parseArgs } from "node:util";
 import open from "open";
 
 import { AbortError, CliError, DeviceError, OAuthError } from "./errors.js";
+import { loadGoogleClient } from "./antigravity-client.js";
 import { claudeBrowserLogin } from "./claude-oauth.js";
+import { googleBrowserLogin } from "./google-oauth.js";
 import { browserLogin } from "./oauth.js";
 import { readHidden } from "./prompt.js";
 import { requestDevice, resolvePort } from "./serial-link.js";
@@ -28,16 +30,17 @@ update 选项（至少指定一个；未指定的参数保持设备原值不变�
   --openrouter-key KEY   更新 OpenRouter 余额 key；可重复或用逗号分隔，最多 4 个
   --utc-offset +HH:MM   更新时区偏移
   --rows "chatgpt:7d,deepseek,openrouter"
-                        配置屏幕显示哪些行、顺序、窗口和刷新间隔（最多 3 行）：
-                        来源可以是 chatgpt / claude / deepseek / openrouter，
-                        chatgpt、claude 可加 :7d 或 :5h；余额来源不写窗口。
+                        配置屏幕显示哪些行、顺序、窗口和刷新间隔（最多 4 行）：
+                        来源可以是 chatgpt / claude / antigravity / deepseek /
+                        openrouter；chatgpt、claude 可加 :7d 或 :5h，
+                        antigravity 只支持 :7d，余额来源不写窗口。
                         每行可用 @间隔 覆盖默认节奏（10s～24h，如 @30s / @5m，
                         默认窗口 10m、余额 50s）。没列出的来源不再抓取，
                         但凭据保留在设备里。
   --port PORT           手动指定串口；默认自动发现 Espressif 设备
 
 login 选项：
-  --provider NAME       claude（默认）/ chatgpt（别名 codex）
+  --provider NAME       claude（默认）/ chatgpt（别名 codex）/ antigravity
   --port PORT          手动指定串口；默认自动发现 Espressif 设备
   --no-browser          不自动打开浏览器
 
@@ -65,9 +68,11 @@ function requireString(value: string | undefined, option: string): string {
 export const MAX_API_KEYS = 4;
 const MAX_API_KEY_LENGTH = 128;
 
-export const MAX_ROWS = 3;
-const ROW_SOURCES = ["chatgpt", "claude", "deepseek", "openrouter"];
-const WINDOW_SOURCES = ["chatgpt", "claude"];
+export const MAX_ROWS = 4;
+const ROW_SOURCES = ["chatgpt", "claude", "antigravity", "deepseek", "openrouter"];
+// 窗口来源；antigravity 只有每周额度（上游没有 5h 桶），所以单独限制窗口值。
+const WINDOW_SOURCES = ["chatgpt", "claude", "antigravity"];
+const FIVE_HOUR_SOURCES = ["chatgpt", "claude"];
 const ROW_WINDOWS = ["7d", "5h"];
 const MIN_REFRESH_SECONDS = 10;
 const MAX_REFRESH_SECONDS = 24 * 60 * 60;
@@ -84,7 +89,8 @@ export function parseRefreshInterval(value: string): number {
   return seconds;
 }
 
-// 与固件 row_config.h 同一套语法：逗号分隔、顺序即行序、chatgpt/claude 可带窗口。
+// 与固件 row_config.h 同一套语法：逗号分隔、顺序即行序，窗口行可带窗口
+// （antigravity 只有 7d）。
 // 在电脑侧先校验，避免把明显写错的配置下发到设备。
 export function parseRows(value: string): string {
   const tokens = value.split(",").map((token) => token.trim());
@@ -109,6 +115,9 @@ export function parseRows(value: string): string {
       }
       if (!ROW_WINDOWS.includes(window)) {
         throw new CliError(`窗口只接受 7d 或 5h：${window}`);
+      }
+      if (window === "5h" && !FIVE_HOUR_SOURCES.includes(name)) {
+        throw new CliError(`${name} 只支持 7d（没有 5 小时额度）`);
       }
     }
     const description = window === undefined ? name : `${name}:${window}`;
@@ -229,10 +238,11 @@ async function loginDevice(args: string[]): Promise<void> {
       provider: { type: "string", default: "claude" },
     },
   });
-  if (!["claude", "codex", "chatgpt"].includes(values.provider)) {
-    throw new CliError("--provider 只接受 claude 或 chatgpt（兼容别名 codex）");
+  if (!["claude", "codex", "chatgpt", "antigravity"].includes(values.provider)) {
+    throw new CliError("--provider 只接受 claude、chatgpt（兼容别名 codex）或 antigravity");
   }
   const isClaude = values.provider === "claude";
+  const isAntigravity = values.provider === "antigravity";
   const port = await resolvePort(values.port);
   if (isClaude) {
     const status = await requestDevice(port, { cmd: "status" }, 20_000);
@@ -240,7 +250,20 @@ async function loginDevice(args: string[]): Promise<void> {
       throw new DeviceError("请先烧录支持 Claude 的固件，再运行 login");
     }
   }
-  const login = isClaude ? claudeBrowserLogin : browserLogin;
+  if (isAntigravity) {
+    const status = await requestDevice(port, { cmd: "status" }, 20_000);
+    if (!("antigravity_configured" in status)) {
+      throw new DeviceError("请先烧录支持 Antigravity 的固件，再运行 login");
+    }
+  }
+  // Antigravity 的 Google 客户端来自本地配置/环境变量：缺了就在打开浏览器前报错。
+  const googleClient = isAntigravity ? loadGoogleClient() : undefined;
+  const login = isClaude
+    ? (onUrl: (url: string) => void | Promise<void>) => claudeBrowserLogin(onUrl)
+    : isAntigravity
+      ? (onUrl: (url: string) => void | Promise<void>) =>
+          googleBrowserLogin(onUrl, googleClient!)
+      : (onUrl: (url: string) => void | Promise<void>) => browserLogin(onUrl);
   const tokens = await login(async (url) => {
     console.log(`正在打开 OAuth 授权页：${url}`);
     if (!values["no-browser"]) {
@@ -254,10 +277,17 @@ async function loginDevice(args: string[]): Promise<void> {
     console.log("等待浏览器登录完成并回调 CLI……");
   });
   const loginPayload = {
-    cmd: isClaude ? "claude_login" : "login",
+    cmd: isClaude ? "claude_login" : isAntigravity ? "antigravity_login" : "login",
     access_token: tokens.accessToken,
     refresh_token: tokens.refreshToken,
-    ...(isClaude ? {} : { account_id: tokens.accountId }),
+    // antigravity 用邮箱做展示，claude 不需要账号字段。
+    ...(isClaude
+      ? {}
+      : isAntigravity
+        ? tokens.accountId
+          ? { account: tokens.accountId }
+          : {}
+        : { account_id: tokens.accountId }),
     expires_at: tokens.expiresAt,
   };
   const redactedAuthenticationBody = Object.fromEntries(
@@ -287,7 +317,9 @@ async function loginDevice(args: string[]): Promise<void> {
     loginPayload,
     20_000,
   );
-  console.log(`${isClaude ? "Claude" : "ChatGPT"} 登录凭据已写入设备：${String(response.account_id ?? "已更新")}`);
+  const providerName = isClaude ? "Claude" : isAntigravity ? "Antigravity" : "ChatGPT";
+  const accountLabel = String(response.account_id ?? tokens.accountId ?? "已更新");
+  console.log(`${providerName} 登录凭据已写入设备：${accountLabel}`);
 }
 
 async function simpleCommand(command: Exclude<Command, "update" | "login">, args: string[]) {

@@ -1,0 +1,4 @@
+{
+  "clientId": "<your-client-id>.apps.googleusercontent.com",
+  "clientSecret": "<your-client-secret>"
+}

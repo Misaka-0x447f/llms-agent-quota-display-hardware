@@ -53,7 +53,12 @@ test("normalizes rows config", () => {
   assert.equal(parseRows("chatgpt:7d,deepseek,openrouter"), "chatgpt:7d,deepseek,openrouter");
   assert.equal(parseRows(" chatgpt , deepseek "), "chatgpt,deepseek");
   assert.equal(parseRows("chatgpt:5h,chatgpt:7d,openrouter"), "chatgpt:5h,chatgpt:7d,openrouter");
-  assert.equal(MAX_ROWS, 3);
+  assert.equal(MAX_ROWS, 4);
+  // 4 行是合法配置（第 4 行不再被拒）。
+  assert.equal(
+    parseRows("chatgpt:7d,antigravity:7d,deepseek,openrouter"),
+    "chatgpt:7d,antigravity:7d,deepseek,openrouter",
+  );
 });
 
 test("rejects malformed rows config", () => {
@@ -69,7 +74,8 @@ test("rejects malformed rows config", () => {
     "deepseek:7d",
     "openrouter:5h",
     "unknown",
-    "chatgpt,deepseek,openrouter,claude",
+    // 最多 4 行；5 项仍然拒绝。
+    "chatgpt,deepseek,openrouter,claude,claude",
   ];
   for (const value of invalid) {
     assert.throws(() => parseRows(value), CliError, value);

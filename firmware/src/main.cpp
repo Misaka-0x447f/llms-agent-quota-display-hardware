@@ -9,12 +9,14 @@
 #include <time.h>
 
 #include "ui_glyphs.h"
+#include "antigravity_protocol.h"
 #include "claude_protocol.h"
 #include "codex_protocol.h"
 #include "row_config.h"
 #include "freshness_format.h"
 #include "refresh_plan.h"
 #include "row_view.h"
+#include "window_render.h"
 #include "delta_format.h"
 #include "balance_protocol.h"
 #include "balance_format.h"
@@ -57,6 +59,31 @@ constexpr char kClaudeUsageUrl[] = "https://api.anthropic.com/api/oauth/usage";
 constexpr char kCodexClientId[] = "app_EMoamEEZ73f0CkXaXp7hrann";
 constexpr char kCodexTokenUrl[] = "https://auth.openai.com/oauth/token";
 constexpr char kCodexUsageUrl[] = "https://chatgpt.com/backend-api/wham/usage";
+// Antigravity（Google Cloud Code）用的是 Antigravity 自己的 installed-app 客户端，
+// 它只能走回环重定向，不能走设备码（Google 只允许 "TVs and Limited Input devices"
+// 类型的客户端用设备码）。
+//
+// client id / secret 被 GitHub push protection 当成 secret，所以不写进仓库：
+// 构建时由 firmware/scripts/gen_antigravity_client.py 从本地配置
+// cli/antigravity-client.json（gitignore）或环境变量生成 antigravity_client.h。
+#include "antigravity_client.h"
+using antigravity_client::kClientId;
+using antigravity_client::kClientSecret;
+constexpr char kAntigravityTokenUrl[] = "https://oauth2.googleapis.com/token";
+// 配额与档位/余额两个只读接口；daily 与 prod 两个通道都要试（见 refreshAntigravityUsage）。
+constexpr char kAntigravityQuotaPath[] = "/v1internal:retrieveUserQuotaSummary";
+constexpr char kAntigravityPlanPath[] = "/v1internal:loadCodeAssist";
+constexpr char kAntigravityDailyHost[] = "daily-cloudcode-pa.googleapis.com";
+constexpr char kAntigravityProdHost[] = "cloudcode-pa.googleapis.com";
+// 配额接口对 User-Agent 有门禁：只有 `antigravity/hub/<版本> <os>/<arch>` 这种
+// Antigravity Hub 形态才会返回完整的 Gemini + Claude/GPT 四个桶；其它 UA（纯
+// "antigravity"、antigravity/1.15.7、node 客户端 UA）只返回 3p-*（Claude/GPT）组，
+// 或者直接 403。2026-11-25 在真实账号上实测。
+constexpr char kAntigravityQuotaUserAgent[] = "antigravity/hub/2.23.0 windows/amd64";
+// NVS 键名含结尾 NUL 最多 16 字节（NVS_KEY_NAME_MAX_SIZE），所以名字最多 15 个字符：
+// "antigravity_auth" 有 16 个，putBytes 会返回 0，凭据永远写不进去。
+constexpr char kAntigravityAuthKey[] = "antigravity";
+static_assert(sizeof(kAntigravityAuthKey) <= 16, "NVS 键名（含 NUL）不能超过 16 字节");
 
 struct ClaudeAuth {
   String provisionId;
@@ -70,6 +97,21 @@ struct ClaudeAuth {
 };
 ClaudeAuth claudeAuth;
 uint32_t claudeBlockedUntil = 0;
+
+// Antigravity 的凭据单独存在一个 NVS 值里（与 Claude / ChatGPT 同一套保护：
+// 续期前先落 pending，成功后一次写入）。Google 不轮换这个客户端的 refresh token，
+// 但仍然按「结果不确定就不再重放」处理，避免上游以后改变行为时静默失效。
+struct AntigravityAuth {
+  String provisionId;
+  String account;  // 登录用的 Google 邮箱，只用于 `status` 展示
+  String accessToken;
+  String refreshToken;
+  uint64_t expiresAt = 0;
+  bool pending = false;
+  bool needsLogin = false;
+  bool configured() const { return !accessToken.isEmpty() && !refreshToken.isEmpty(); }
+};
+AntigravityAuth antigravityAuth;
 
 extern const uint8_t rootca_crt_bundle_start[]
     asm("_binary_data_cert_x509_crt_bundle_bin_start");
@@ -119,6 +161,7 @@ struct Settings {
     switch (source) {
       case quota::RowSource::kChatgpt: return codexConfigured();
       case quota::RowSource::kClaude: return claudeAuth.configured();
+      case quota::RowSource::kAntigravity: return antigravityAuth.configured();
       case quota::RowSource::kDeepseek: return deepseekConfigured();
       case quota::RowSource::kOpenrouter: return openrouterConfigured();
     }
@@ -176,13 +219,26 @@ RateWindow fiveHour;
 RateWindow sevenDay;
 RateWindow chatgptFive;
 RateWindow chatgptSeven;
+RateWindow antigravitySeven;
+// Antigravity 的档位与充值余额：只用于 `status` 展示和「额度用尽后显示余额」。
+String antigravityPlan;
+String antigravityProject;
+antigravity::Credits antigravityCredits;
+// 余额缓存的保鲜期：单次坏响应保留旧金额，但超过这个时长还没确认过就不再显示，
+// 免得把很久以前的钱当成当前余额（3 个默认窗口刷新周期）。
+constexpr uint32_t kAntigravityCreditsMaxAgeMs = 30 * 60 * 1000UL;
+uint32_t antigravityCreditsOkMs = 0;  // 0 = 还没有成功拿到过余额
+// 最近一次「200 但没有 gemini-weekly」时实际看到的 bucket id，只用于错误详情。
+String debugAntigravityBuckets;
 // 时钟未同步时 expiresAt 只能是 0（未知），用单调时钟限制主动续期频率：
 // 至少 60 分钟才主动续一次；access token 真过期时走 401 触发的续期。
 constexpr uint32_t kMinimumTokenRefreshMs = 60 * 60 * 1000UL;
 uint32_t codexTokenRefreshMs = 0;
 uint32_t claudeTokenRefreshMs = 0;
+uint32_t antigravityTokenRefreshMs = 0;
 SourceStatus claudeSource;
 SourceStatus chatgptSource;
+SourceStatus antigravitySource;
 BalanceGroup deepseekBalances;
 BalanceGroup openrouterBalances;
 
@@ -191,6 +247,7 @@ SourceStatus* statusFor(quota::RowSource source) {
   switch (source) {
     case quota::RowSource::kChatgpt: return &chatgptSource;
     case quota::RowSource::kClaude: return &claudeSource;
+    case quota::RowSource::kAntigravity: return &antigravitySource;
     case quota::RowSource::kDeepseek: return &deepseekBalances.status;
     case quota::RowSource::kOpenrouter: return &openrouterBalances.status;
   }
@@ -207,9 +264,10 @@ bool rowEnabled(quota::RowSource source) {
 // 没写进 rows 的来源不再抓取，也不该在 `status` 里继续报上一次的错误。
 // 只清状态字段（数据本身留着），重新加回行时会立即抓一次。
 void resetDisabledSourceStatus() {
-  const quota::RowSource sources[] = {quota::RowSource::kChatgpt, quota::RowSource::kClaude,
-                                      quota::RowSource::kDeepseek,
-                                      quota::RowSource::kOpenrouter};
+  const quota::RowSource sources[] = {
+      quota::RowSource::kChatgpt,     quota::RowSource::kClaude,
+      quota::RowSource::kAntigravity, quota::RowSource::kDeepseek,
+      quota::RowSource::kOpenrouter};
   for (quota::RowSource source : sources) {
     if (rowEnabled(source)) continue;
     SourceStatus* status = statusFor(source);
@@ -242,15 +300,16 @@ uint32_t nextRedrawAtMs = 0;
 uint8_t drawnPhase = 0;
 bool refreshRequested = false;
 bool sntpStarted = false;
-// 哪几行正在抓取（bit0 Claude、bit1 DeepSeek、bit2 OpenRouter、bit3 ChatGPT）。这是 loading
-// 动画唯一的开关：只在 refreshSources 里置位，函数返回时统一清零，所以「刷新
-// 循环从未启动」的配置不会留下一条永远转动的线。单字节写在单核上是原子的，
-// 读端在显示锁内读一次。
+// 哪几行正在抓取（bit0 Claude、bit1 DeepSeek、bit2 OpenRouter、bit3 ChatGPT、
+// bit4 Antigravity）。这是 loading 动画唯一的开关：只在 refreshSources 里置位，
+// 函数返回时统一清零，所以「刷新循环从未启动」的配置不会留下一条永远转动的线。
+// 单字节写在单核上是原子的，读端在显示锁内读一次。
 volatile uint8_t fetchingMask = 0;
 constexpr uint8_t kFetchClaude = 1u << 0;
 constexpr uint8_t kFetchDeepseek = 1u << 1;
 constexpr uint8_t kFetchOpenrouter = 1u << 2;
 constexpr uint8_t kFetchChatgpt = 1u << 3;
+constexpr uint8_t kFetchAntigravity = 1u << 4;
 constexpr uint8_t kDisplayI2cAddress = 0x3c;
 
 uint32_t epochNow() {
@@ -289,6 +348,11 @@ void scheduleSourceRetry(SourceStatus& source, uint32_t intervalSeconds) {
   }
   if (&source == &chatgptSource &&
       (settings.codexPending || settings.codexNeedsLogin)) {
+    source.dueAtMs = 0;
+    return;
+  }
+  if (&source == &antigravitySource &&
+      (antigravityAuth.pending || antigravityAuth.needsLogin)) {
     source.dueAtMs = 0;
     return;
   }
@@ -497,6 +561,70 @@ bool saveCodexAuth() {
   return true;
 }
 
+// Antigravity 凭据：与 ChatGPT / Claude 一样整份存成单个 NVS 值（blob），
+// 续期前先写 pending，成功后一次提交，断电不会留下半代凭据。
+bool saveAntigravityAuth(const AntigravityAuth& auth) {
+  if (!auth.configured()) {
+    preferences.remove(kAntigravityAuthKey);
+    return true;
+  }
+  cJSON* root = cJSON_CreateObject();
+  if (root == nullptr) return false;
+  const bool complete =
+      cJSON_AddStringToObject(root, "access", auth.accessToken.c_str()) != nullptr &&
+      cJSON_AddStringToObject(root, "refresh", auth.refreshToken.c_str()) != nullptr &&
+      cJSON_AddStringToObject(root, "account", auth.account.c_str()) != nullptr &&
+      cJSON_AddNumberToObject(root, "expires", static_cast<double>(auth.expiresAt)) != nullptr &&
+      cJSON_AddBoolToObject(root, "pending", auth.pending) != nullptr &&
+      cJSON_AddBoolToObject(root, "needs_login", auth.needsLogin) != nullptr &&
+      cJSON_AddStringToObject(root, "provision", auth.provisionId.c_str()) != nullptr;
+  if (!complete) {
+    cJSON_Delete(root);
+    return false;
+  }
+  char* text = cJSON_PrintUnformatted(root);
+  bool ok = text != nullptr;
+  if (ok) {
+    const size_t length = strlen(text);
+    ok = length > 0 && preferences.putBytes(kAntigravityAuthKey, text, length) == length;
+    cJSON_free(text);
+  }
+  cJSON_Delete(root);
+  return ok;
+}
+
+void loadAntigravityAuth() {
+  size_t length = preferences.getBytesLength(kAntigravityAuthKey);
+  if (length == 0) return;
+  char* buffer = static_cast<char*>(malloc(length + 1));
+  if (buffer == nullptr) return;
+  const size_t read = preferences.getBytes(kAntigravityAuthKey, buffer, length);
+  buffer[read] = '\0';
+  String stored = buffer;
+  free(buffer);
+  cJSON* root = cJSON_ParseWithOpts(stored.c_str(), nullptr, true);
+  if (root == nullptr) return;
+  AntigravityAuth candidate;
+  const cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires");
+  // expires == 0 表示「未知」（时钟未同步时续期写不下绝对时间），不能因此丢凭据。
+  const bool expiresValid =
+      cJSON_IsNumber(expires) &&
+      (expires->valuedouble == 0 ||
+       claude::integer(expires, kMinimumValidEpoch, UINT32_MAX));
+  if (jsonString(root, "access", candidate.accessToken) &&
+      jsonString(root, "refresh", candidate.refreshToken) && expiresValid &&
+      candidate.configured()) {
+    candidate.expiresAt = static_cast<uint64_t>(expires->valuedouble);
+    jsonString(root, "account", candidate.account);
+    jsonString(root, "provision", candidate.provisionId);
+    candidate.pending = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "pending"));
+    candidate.needsLogin =
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "needs_login"));
+    antigravityAuth = candidate;
+  }
+  cJSON_Delete(root);
+}
+
 void resetBalanceGroup(BalanceGroup& group, const String& rawKeys) {
   group = BalanceGroup{};
   key_list::List keys;
@@ -517,6 +645,7 @@ void loadSettings() {
   settings.openrouterKeys = preferences.getString("openrouter");
   settings.expiresAt = preferences.getULong64("expires", 0);
   loadCodexAuth();
+  loadAntigravityAuth();
   // 旧固件把 ChatGPT 凭据拆成 access/refresh/account/expires 四个 key；当它们组成
   // 完整的旧记录时（首次升级，或降级后旧固件又写过），以它们为准重新迁到单值存储，
   // 避免单值里留着更旧的 token；残缺残留不参与判断，随迁移一起清掉。
@@ -572,6 +701,13 @@ void clearSettings() {
   claudeAuth = ClaudeAuth{};
   claudeBlockedUntil = 0;
   claudeSource = SourceStatus{};
+  antigravityAuth = AntigravityAuth{};
+  antigravitySource = SourceStatus{};
+  antigravitySeven = RateWindow{};
+  antigravityPlan = "";
+  antigravityProject = "";
+  antigravityCredits = antigravity::Credits{};
+  antigravityCreditsOkMs = 0;
   deepseekBalances = BalanceGroup{};
   openrouterBalances = BalanceGroup{};
   fiveHour = RateWindow{};
@@ -581,6 +717,7 @@ void clearSettings() {
   chatgptSource = SourceStatus{};
   codexTokenRefreshMs = 0;
   claudeTokenRefreshMs = 0;
+  antigravityTokenRefreshMs = 0;
   // 清空后回到默认行配置（ChatGPT 7d + 两个余额），凭据已经一起清掉。
   settings.rows = quota::kDefaultRows;
   quota::RowConfig defaultRows[quota::kMaxRows];
@@ -994,6 +1131,318 @@ bool refreshChatgptUsage() {
   return true;
 }
 
+// Antigravity（Google Cloud Code）只读请求：JSON + Bearer。返回 HTTP 状态，
+// 传输失败返回 <=0 并记下错误详情。
+// User-Agent 是必要的：cloudcode-pa 对不认识的 UA 直接 403（上游行为，见 README）。
+int postAntigravity(const char* host, const char* path, const char* userAgent,
+                    const String& body, String& response,
+                    const char* apiClient = nullptr) {
+  if (!resolveHost(host)) return -1;
+  WiFiClientSecure client;
+  client.setCACertBundle(rootca_crt_bundle_start);
+  HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(15000);
+  const String url = String("https://") + host + path;
+  if (!http.begin(client, url)) {
+    setError(UiState::kTransportError, "Antigravity 请求初始化失败");
+    return -1;
+  }
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + antigravityAuth.accessToken);
+  // HTTPClient::addHeader() 会静默忽略 User-Agent（它只认 setUserAgent），
+  // 而上游会按 UA 拒绝不认识的客户端，所以必须走 setUserAgent。
+  http.setUserAgent(userAgent);
+  if (apiClient != nullptr) {
+    http.addHeader("X-Goog-Api-Client", apiClient);
+  }
+  const int status = http.POST(body);
+  if (status == 200) response = http.getString();
+  http.end();
+  if (status <= 0) {
+    setError(transportState(status, client), transportDetail("Antigravity", status, client));
+  }
+  return status;
+}
+
+// 配额摘要：daily 与 prod 两个通道都试，取能解析出 gemini-weekly 的那份。
+// 公开证据对哪个通道权威互相矛盾（一份说 daily 缺 Gemini 组，另一份说 prod 会
+// 卡在过期窗口），所以先 daily（与生成请求同路），缺组时再问 prod。
+enum class QuotaFetch : uint8_t {
+  kOk,           // 拿到了可用的每周窗口
+  kAuthRejected, // 两个通道都明确 401/403：令牌或账号问题
+  kBadData,      // 有 200 响应但里面没有 gemini-weekly
+  kTransient,    // 传输失败 / 5xx / 一台拒绝另一台不可用
+};
+
+QuotaFetch fetchAntigravityQuota(RateWindow& seven) {
+  // 档位响应里带 cloudaicompanionProject；带上它查询可以让账号落在自己的额度池。
+  // 用 cJSON 构造 body：项目 id 来自上游，手拼字符串遇到引号/反斜杠会发出坏 JSON。
+  String body = "{}";
+  if (!antigravityProject.isEmpty()) {
+    cJSON* root = cJSON_CreateObject();
+    if (root != nullptr &&
+        cJSON_AddStringToObject(root, "project", antigravityProject.c_str()) != nullptr) {
+      char* encoded = cJSON_PrintUnformatted(root);
+      if (encoded != nullptr) {
+        body = encoded;
+        cJSON_free(encoded);
+      }
+    }
+    cJSON_Delete(root);
+  }
+  const char* hosts[] = {kAntigravityDailyHost, kAntigravityProdHost};
+  int authRejections = 0;
+  int hostCount = 0;
+  int lastStatus = -1;
+  bool sawHttp200 = false;
+  String lastResponse;
+  for (const char* host : hosts) {
+    ++hostCount;
+    String response;
+    const int status =
+        postAntigravity(host, kAntigravityQuotaPath, kAntigravityQuotaUserAgent, body, response);
+    if (status == 401 || status == 403) {
+      // 一台拒绝不代表令牌失效（可能是这台主机的 UA/灰度差异），继续问另一台。
+      ++authRejections;
+      lastStatus = status;
+      continue;
+    }
+    if (status != 200) {
+      lastStatus = status;
+      continue;
+    }
+    sawHttp200 = true;
+    lastStatus = 200;
+    RateWindow candidate;
+    if (antigravity::parseQuotaSummary(response.c_str(), candidate)) {
+      seven = candidate;
+      return QuotaFetch::kOk;
+    }
+    // 只有解析失败才留一份响应做诊断摘要，成功路径不做这次复制。
+    lastResponse = response;
+  }
+  if (authRejections > 0 && authRejections == hostCount) return QuotaFetch::kAuthRejected;
+  if (sawHttp200) {
+    // 把实际看到的 bucket id 带进错误详情，方便判断是上游换了 id 还是这台账号
+    // 根本没有 Gemini 组。
+    char described[64] = {};
+    antigravity::describeBuckets(lastResponse.c_str(), described, sizeof(described));
+    debugAntigravityBuckets = described;
+    return QuotaFetch::kBadData;
+  }
+  if (authRejections > 0) {
+    // 只有一台拒绝、另一台不可用：不是登录失效，别把状态词写成「登录失效」。
+    setError(UiState::kHttpError, "Antigravity 接口暂时不可用");
+  } else if (lastStatus > 0) {
+    setError(classifyHttpStatus(lastStatus), "Antigravity 接口返回 HTTP " + String(lastStatus));
+  }
+  return QuotaFetch::kTransient;
+}
+
+// 档位与充值余额：先 daily（与 agy 的档位查询一致），拿不到充值余额再问 prod。
+//
+// 充值余额决定「额度用尽后这一行显示什么」，是必须信息；档位只在 `status` 里展示。
+// 所以只要还没解析出 credits 就继续问下一台主机，而不是拿到档位就返回。
+//
+// 三种结果分开处理：找到 → 采用；合法响应里明确没有 → 清空（屏幕显示 `--`）；
+// 响应本身无效（空/被截断/不是 JSON）→ 保留旧值，等下一次抓取。
+bool fetchAntigravityPlanAndCredits() {
+  const char* hosts[] = {kAntigravityDailyHost, kAntigravityProdHost};
+  bool sawAbsent = false;
+  for (const char* host : hosts) {
+    String response;
+    if (postAntigravity(host, kAntigravityPlanPath, kAntigravityQuotaUserAgent, "{}", response) !=
+        200) {
+      continue;
+    }
+    char plan[48] = {};
+    if (antigravity::parsePlan(response.c_str(), plan, sizeof(plan))) antigravityPlan = plan;
+    char project[64] = {};
+    if (antigravity::parseProject(response.c_str(), project, sizeof(project))) {
+      antigravityProject = project;
+    }
+    antigravity::Credits credits;
+    switch (antigravity::parseCredits(response.c_str(), credits)) {
+      case antigravity::CreditsStatus::kFound:
+        antigravityCredits = credits;
+        antigravityCreditsOkMs = millis();
+        return true;
+      case antigravity::CreditsStatus::kAbsent:
+        // 这台主机明确说没有 AI Credits；另一台可能还有，继续问。
+        sawAbsent = true;
+        continue;
+      case antigravity::CreditsStatus::kInvalid:
+        // 响应本身无效：换一台主机再试。
+        continue;
+    }
+  }
+  if (sawAbsent) {
+    // 有合法响应明确没有这一项：清掉旧值，屏幕显示 `--`。
+    antigravityCredits = antigravity::Credits{};
+    antigravityCreditsOkMs = 0;
+    return false;
+  }
+  // 这次没拿到有效响应（传输/HTTP 失败，或两台都返回坏数据）：保留旧值，
+  // 但超过保鲜期就不再当作当前余额。
+  if (antigravityCredits.present && antigravityCreditsOkMs != 0 &&
+      millis() - antigravityCreditsOkMs > kAntigravityCreditsMaxAgeMs) {
+    antigravityCredits = antigravity::Credits{};
+    antigravityCreditsOkMs = 0;
+  }
+  return false;
+}
+
+// Antigravity OAuth 续期：refresh_token 换 access_token（Google 不轮换这个客户端的
+// refresh token，但仍按同一套「先落 pending」保护处理）。
+bool refreshAntigravityToken() {
+  if (kClientId[0] == '\0' || kClientSecret[0] == '\0') {
+    setError(UiState::kConfigError, "Antigravity 客户端未配置，无法续期，请重新运行 login");
+    return false;
+  }
+  if (antigravityAuth.pending) {
+    setError(UiState::kAuthError, "Antigravity 续期结果不确定，请重新运行 login");
+    return false;
+  }
+  if (!resolveHost("oauth2.googleapis.com")) return false;
+  WiFiClientSecure client;
+  client.setCACertBundle(rootca_crt_bundle_start);
+  HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(30000);
+  if (!http.begin(client, kAntigravityTokenUrl)) {
+    setError(UiState::kTransportError, "Antigravity OAuth 请求初始化失败");
+    return false;
+  }
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  const String body = "grant_type=refresh_token&client_id=" +
+                      formEncode(kClientId) +
+                      "&client_secret=" + formEncode(kClientSecret) +
+                      "&refresh_token=" + formEncode(antigravityAuth.refreshToken);
+  // 记录「尝试」时间，时钟未同步时用它限流。
+  antigravityTokenRefreshMs = millis();
+  AntigravityAuth pending = antigravityAuth;
+  pending.pending = true;
+  if (!saveAntigravityAuth(pending)) {
+    http.end();
+    setError(UiState::kConfigError, "无法保存 Antigravity 续期状态，未发送请求");
+    return false;
+  }
+  antigravityAuth = pending;
+  const int status = http.POST(body);
+  const String response = status == 200 ? http.getString() : String();
+  http.end();
+  if (status <= 0) {
+    // 请求可能已被上游处理：保留 pending，要求重新登录，避免重放旧令牌。
+    setError(UiState::kAuthError, "Antigravity OAuth 续期响应丢失，请重新运行 login");
+    return false;
+  }
+  if (status != 200) {
+    const bool retryable = status == 429 || status >= 500;
+    if (retryable) {
+      pending.pending = false;
+      if (saveAntigravityAuth(pending)) antigravityAuth = pending;
+    }
+    setError(antigravityAuth.pending ? UiState::kAuthError : classifyHttpStatus(status),
+             "Antigravity OAuth 服务返回 HTTP " + String(status));
+    return false;
+  }
+  cJSON* root = cJSON_ParseWithOpts(response.c_str(), nullptr, true);
+  AntigravityAuth candidate = antigravityAuth;
+  const cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires_in");
+  const bool valid = jsonString(root, "access_token", candidate.accessToken) &&
+                     !candidate.accessToken.isEmpty() &&
+                     claude::integer(expires, 1, 365 * 86400);
+  String rotated;
+  if (valid && jsonString(root, "refresh_token", rotated) && !rotated.isEmpty()) {
+    candidate.refreshToken = rotated;
+  }
+  if (valid) {
+    candidate.expiresAt =
+        claude::expiryFor(epochNow(), static_cast<uint32_t>(expires->valuedouble));
+  }
+  cJSON_Delete(root);
+  if (!valid) {
+    setError(UiState::kAuthError, "Antigravity OAuth 续期响应无效，请重新运行 login");
+    return false;
+  }
+  candidate.pending = false;
+  candidate.needsLogin = false;
+  const AntigravityAuth previous = antigravityAuth;
+  antigravityAuth = candidate;
+  if (!saveAntigravityAuth(candidate)) {
+    antigravityAuth = previous;
+    setError(UiState::kAuthError, "Antigravity 新凭据写入失败，请重新运行 login");
+    return false;
+  }
+  return true;
+}
+
+bool refreshAntigravityUsage() {
+  if (antigravityAuth.pending || antigravityAuth.needsLogin) {
+    setError(UiState::kAuthError, "Antigravity 凭据需要重新授权，请运行 login");
+    return false;
+  }
+  bool refreshed = false;
+  const uint32_t nowEpoch = epochNow();
+  bool tokenDue = false;
+  if (nowEpoch == 0) {
+    tokenDue = antigravityTokenRefreshMs == 0 ||
+               millis() - antigravityTokenRefreshMs >= kMinimumTokenRefreshMs;
+  } else {
+    tokenDue = antigravityAuth.expiresAt == 0 ||
+               antigravityAuth.expiresAt <= static_cast<uint64_t>(nowEpoch) + 120;
+  }
+  if (tokenDue) {
+    if (!refreshAntigravityToken()) return false;
+    refreshed = true;
+  }
+  // 档位（含 project）与充值余额先抓：它们独立于配额，配额失败时也该显示出来。
+  fetchAntigravityPlanAndCredits();
+  RateWindow candidate;
+  QuotaFetch result = fetchAntigravityQuota(candidate);
+  if (result == QuotaFetch::kAuthRejected && !refreshed) {
+    // 刚续期过就不再连环续期，避免时钟未同步或上游异常时反复打 token 端点。
+    if (antigravityTokenRefreshMs != 0 &&
+        millis() - antigravityTokenRefreshMs < 60 * 1000UL) {
+      setError(UiState::kAuthError, "Antigravity 凭据验证失败，请稍后重试或重新 login");
+      return false;
+    }
+    if (!refreshAntigravityToken()) return false;
+    // 续期前那次档位/余额是用旧令牌抓的（很可能失败或没拿到 project）：
+    // 用新令牌再抓一次，然后重试配额。
+    fetchAntigravityPlanAndCredits();
+    result = fetchAntigravityQuota(candidate);
+  }
+  if (result == QuotaFetch::kAuthRejected) {
+    // 两个通道都拒绝：停止自动续期，等用户重新 login。
+    setError(UiState::kAuthError, "Antigravity 凭据被拒绝，请重新运行 login");
+    antigravityAuth.needsLogin = true;
+    if (!saveAntigravityAuth(antigravityAuth)) {
+      setError(UiState::kConfigError, "无法保存 Antigravity 需要重新登录的状态");
+    }
+    return false;
+  }
+  if (result == QuotaFetch::kBadData) {
+    String detail = "Antigravity 配额响应里没有可用的 Gemini 每周额度";
+    if (!debugAntigravityBuckets.isEmpty()) detail += "（" + debugAntigravityBuckets + "）";
+    setError(UiState::kDataError, detail);
+    return false;
+  }
+  if (result != QuotaFetch::kOk) {
+    // 传输/HTTP 失败：postAntigravity 已经写了具体错误；这里只是兜底文案。
+    if (lastErrorDetail.isEmpty()) {
+      setError(UiState::kHttpError, "Antigravity 接口暂时不可用");
+    }
+    return false;
+  }
+  antigravitySeven = candidate;
+  sourceSucceeded(antigravitySource, sourceInterval(quota::RowSource::kAntigravity));
+  return true;
+}
+
 bool refreshBalance(const char* host, const char* url, const String& key,
                     bool (*parse)(const char*, balance_protocol::Balance&),
                     balance_protocol::Balance& balance) {
@@ -1076,6 +1525,7 @@ void refreshBalanceGroup(const char* host, const char* url, const String& rawKey
 struct DueSources {
   bool chatgpt;
   bool claude;
+  bool antigravity;
   bool deepseek;
   bool openrouter;
 };
@@ -1086,6 +1536,9 @@ DueSources dueSources(bool manual, uint32_t nowMs) {
                 (manual || quota::refreshDue(nowMs, chatgptSource.dueAtMs));
   due.claude = rowEnabled(quota::RowSource::kClaude) && claudeAuth.configured() &&
                (manual || quota::refreshDue(nowMs, claudeSource.dueAtMs));
+  due.antigravity = rowEnabled(quota::RowSource::kAntigravity) &&
+                    antigravityAuth.configured() &&
+                    (manual || quota::refreshDue(nowMs, antigravitySource.dueAtMs));
   due.deepseek = rowEnabled(quota::RowSource::kDeepseek) &&
                  settings.deepseekConfigured() &&
                  (manual || quota::refreshDue(nowMs, deepseekBalances.status.dueAtMs));
@@ -1096,7 +1549,7 @@ DueSources dueSources(bool manual, uint32_t nowMs) {
 }
 
 bool anyDue(const DueSources& due) {
-  return due.chatgpt || due.claude || due.deepseek || due.openrouter;
+  return due.chatgpt || due.claude || due.antigravity || due.deepseek || due.openrouter;
 }
 
 // 全局状态只服务于既有串口语义：按行顺序取第一个异常行，没有异常就是 kReady。
@@ -1122,6 +1575,7 @@ void refreshSources(const DueSources& due) {
   // 联网阶段先把本轮到期的行都点亮：WiFi 重连最长 15 秒，这段时间也该有进度线。
   // 联网就绪后改成按来源逐个点亮，避免「还在排队却显示在抓取」。
   fetchingMask = (due.chatgpt ? kFetchChatgpt : 0) | (due.claude ? kFetchClaude : 0) |
+                 (due.antigravity ? kFetchAntigravity : 0) |
                  (due.deepseek ? kFetchDeepseek : 0) |
                  (due.openrouter ? kFetchOpenrouter : 0);
   if (!connectWiFi()) {
@@ -1133,6 +1587,10 @@ void refreshSources(const DueSources& due) {
     }
     if (due.claude) {
       sourceFailed(claudeSource, sourceInterval(quota::RowSource::kClaude), uiState,
+                   lastErrorDetail);
+    }
+    if (due.antigravity) {
+      sourceFailed(antigravitySource, sourceInterval(quota::RowSource::kAntigravity), uiState,
                    lastErrorDetail);
     }
     if (due.deepseek) {
@@ -1159,6 +1617,13 @@ void refreshSources(const DueSources& due) {
                    lastErrorDetail);
     }
   }
+  if (due.antigravity) {
+    fetchingMask = kFetchAntigravity;
+    if (!refreshAntigravityUsage()) {
+      sourceFailed(antigravitySource, sourceInterval(quota::RowSource::kAntigravity), uiState,
+                   lastErrorDetail);
+    }
+  }
   if (due.deepseek) {
     fetchingMask = kFetchDeepseek;
     refreshBalanceGroup("api.deepseek.com", "https://api.deepseek.com/user/balance",
@@ -1171,30 +1636,6 @@ void refreshSources(const DueSources& due) {
                         settings.openrouterKeys, sourceInterval(quota::RowSource::kOpenrouter),
                         balance_protocol::parseOpenRouter, openrouterBalances);
   }
-}
-
-String formatDuration(uint32_t seconds, bool extended = false) {
-  struct Unit { uint32_t seconds; char suffix; };
-  static const Unit units[] = {{86400, 'd'}, {3600, 'h'}, {60, 'm'}};
-  for (size_t i = 0; i < 3; ++i) {
-    if (seconds >= units[i].seconds || i == 2) {
-      const uint32_t major = seconds / units[i].seconds;
-      String result = String(major) + units[i].suffix;
-      if (extended && i + 1 < 3) {
-        const uint32_t minor = (seconds % units[i].seconds) / units[i + 1].seconds;
-        if (minor > 0) result += String(minor) + units[i + 1].suffix;
-      }
-      return result;
-    }
-  }
-  return "0m";
-}
-
-void drawDeltaGlyph(int16_t x, int16_t baseline) {
-  // 细线框 Δ：避免实心三角形带来的粗重观感。
-  display.drawLine(x + 3, baseline - 7, x, baseline);
-  display.drawLine(x, baseline, x + 6, baseline);
-  display.drawLine(x + 6, baseline, x + 3, baseline - 7);
 }
 
 uint16_t nextCodepoint(const char*& cursor) {
@@ -1236,49 +1677,28 @@ void drawUiText(int16_t x, int16_t top, const char* text) {
   }
 }
 
-void drawWindowLine(int16_t y, const RateWindow& window, bool rightAlignPercent = false) {
-  // 没有数据时也占住这一行：留一片空白会让该行的 loading 线看起来属于下一行。
-  // 余额行的 `--` 就是这样处理的，这里保持一致。
-  if (!window.present) {
-    display.setFont(u8g2_font_7x14_tf);
-    display.drawStr(0, y, "[--]");
-    display.drawStr(128 - display.getStrWidth("--"), y, "--");
-    return;
-  }
-  const uint32_t now = epochNow();
-  const uint32_t remainSeconds = window.resetAt > now ? window.resetAt - now : 0;
-  const float remaining = 100.0f - window.usedPercent;
-  // 时钟未同步时 resetAt 无法换算成剩余时间，显示 -- 而不是把时间戳当天数。
-  const String label = window.resetAt == 0
-      ? String(window.durationSeconds == claude::kFiveHourSeconds ? "5h" : "7d")
-      : (now == 0 ? String("--") : formatDuration(remainSeconds));
-  const String percent = String(static_cast<int>(roundf(remaining))) + "%";
-  const String prefix = "[" + label + "]" + (rightAlignPercent ? "" : "  " + percent);
-  display.setFont(u8g2_font_7x14_tf);
-  display.drawStr(0, y, prefix.c_str());
-  if (rightAlignPercent) {
-    display.drawStr(128 - display.getStrWidth(percent.c_str()), y, percent.c_str());
-  }
+// 窗口行需要的数据：badge 由来源决定；creditMode 表示额度已用尽（或充值余额不足），
+// 这时右侧改显示充值余额而不是配速。
+struct WindowRowData {
+  const char* badge = nullptr;
+  bool creditMode = false;
+  bool creditsKnown = false;
+  double creditAmount = 0;
+};
 
-  const int16_t x = display.getStrWidth(prefix.c_str()) + 4;
-  drawDeltaGlyph(x, y);
-  // 配速同样由 resetAt 与当前时间算出；时钟未就绪时两者都不可用。
-  if (window.resetAt == 0 || window.durationSeconds == 0 || now == 0) {
-    display.drawStr(x + 9, y, "--");
-    return;
-  }
-  const float expectedRemaining = remaining *
-                                  static_cast<float>(window.durationSeconds) / 100.0f;
-  const float rawDelta = static_cast<float>(remainSeconds) - expectedRemaining;
-  char minuteDelta[8];
-  if (quota::formatMinuteDelta(-rawDelta, minuteDelta, sizeof(minuteDelta))) {
-    display.drawStr(x + 9, y, minuteDelta);
-    return;
-  }
-  const char sign = rawDelta >= 0 ? '-' : '+';
-  const uint32_t magnitude = static_cast<uint32_t>(fabsf(rawDelta));
-  const String delta = String(sign) + formatDuration(magnitude, magnitude >= 86400);
-  display.drawStr(x + 9, y, delta.c_str());
+// 绘制本身放在 window_render.h：固件和电脑端的视觉验证脚本用同一份代码。
+void drawWindowLine(int16_t y, const RateWindow& window, const WindowRowData& data) {
+  window_render::Input input;
+  input.present = window.present;
+  input.resetAt = window.resetAt;
+  input.durationSeconds = window.durationSeconds;
+  input.usedPercent = window.usedPercent;
+  input.nowEpoch = epochNow();
+  input.badge = data.badge;
+  input.creditMode = data.creditMode;
+  input.creditsKnown = data.creditsKnown;
+  input.creditAmount = data.creditAmount;
+  window_render::drawWindowRow(display.getU8g2(), y, input, u8g2_font_7x14_tf);
 }
 
 // 视图 2：左侧平台名（可带 * 陈旧标记）与过期时间，右侧状态词。
@@ -1408,6 +1828,7 @@ uint8_t fetchBitFor(quota::RowSource source) {
   switch (source) {
     case quota::RowSource::kChatgpt: return kFetchChatgpt;
     case quota::RowSource::kClaude: return kFetchClaude;
+    case quota::RowSource::kAntigravity: return kFetchAntigravity;
     case quota::RowSource::kDeepseek: return kFetchDeepseek;
     case quota::RowSource::kOpenrouter: return kFetchOpenrouter;
   }
@@ -1435,6 +1856,10 @@ size_t buildRows(RowView* rows) {
       case quota::RowSource::kClaude:
         row.window = rowConfigs[i].window == quota::WindowKind::kFiveHour ? &fiveHour
                                                                           : &sevenDay;
+        break;
+      case quota::RowSource::kAntigravity:
+        // 只取每周额度：antigravity 行固定 7d（配置层已拒绝 :5h）。
+        row.window = &antigravitySeven;
         break;
       case quota::RowSource::kDeepseek:
         row.balances = &deepseekBalances;
@@ -1466,7 +1891,15 @@ void drawRow(const RowView& row, uint8_t phase) {
     return;
   }
   if (row.window != nullptr) {
-    drawWindowLine(row.slot.textY, *row.window, true);
+    WindowRowData data;
+    data.badge = quota::rowBadgeLetter(row.config.source);
+    if (row.config.source == quota::RowSource::kAntigravity) {
+      // 只有额度用尽（屏幕 0%）时才把右侧改成充值余额；余额低于 minimum 不切换。
+      data.creditMode = antigravity::overageMode(*row.window, antigravityCredits);
+      data.creditsKnown = antigravityCredits.present;
+      data.creditAmount = antigravityCredits.amount;
+    }
+    drawWindowLine(row.slot.textY, *row.window, data);
   } else {
     drawBalanceLine(row.slot.textY, row.label, *row.balances);
   }
@@ -1684,6 +2117,7 @@ void handleSerialCommand(const String& line) {
           // 新加进来的来源立即排一次；被移除的来源不再排队（dueAtMs 不再被检查）。
           chatgptSource.dueAtMs = 0;
           claudeSource.dueAtMs = 0;
+          antigravitySource.dueAtMs = 0;
           deepseekBalances.status.dueAtMs = 0;
           openrouterBalances.status.dueAtMs = 0;
         }
@@ -1747,6 +2181,46 @@ void handleSerialCommand(const String& line) {
     } else {
       addResponseBase(response, requestId, false);
       cJSON_AddStringToObject(response, "error", valid ? "Claude 凭据写入失败" : "Claude 登录字段无效");
+    }
+  } else if (command == "antigravity_login" && requestId == antigravityAuth.provisionId) {
+    // 同一登录请求的重发（USB 重试/重启后重放）：只确认，不重新安装旧 token。
+    addResponseBase(response, requestId, true);
+    cJSON_AddStringToObject(response, "provider", "antigravity");
+  } else if (command == "antigravity_login") {
+    AntigravityAuth candidate;
+    candidate.provisionId = requestId;
+    cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
+    // 与 loadAntigravityAuth 同一口径：写入的时间必须能在下次启动读回，
+    // 否则会出现「登录成功但重启后凭据丢失」。
+    const bool valid = jsonString(root, "access_token", candidate.accessToken) &&
+        jsonString(root, "refresh_token", candidate.refreshToken) &&
+        candidate.configured() &&
+        claude::integer(expires, kMinimumValidEpoch, UINT32_MAX);
+    if (valid) {
+      candidate.expiresAt = static_cast<uint64_t>(expires->valuedouble);
+      jsonString(root, "account", candidate.account);
+    }
+    if (valid && saveAntigravityAuth(candidate)) {
+      antigravityAuth = candidate;
+      // 换账号后上一份额度/余额不再属于当前凭据，先清掉再重画。
+      antigravitySeven = RateWindow{};
+      antigravityCredits = antigravity::Credits{};
+      antigravityCreditsOkMs = 0;
+      antigravityPlan = "";
+      antigravityProject = "";
+      antigravitySource = SourceStatus{};
+      antigravityTokenRefreshMs = millis();
+      lastRefreshEpoch = 0;
+      refreshRequested = true;
+      lastErrorDetail = "";
+      uiState = settings.configured() ? UiState::kLoading : UiState::kUnconfigured;
+      drawScreen();
+      addResponseBase(response, requestId, true);
+      cJSON_AddStringToObject(response, "provider", "antigravity");
+    } else {
+      addResponseBase(response, requestId, false);
+      cJSON_AddStringToObject(response, "error",
+                              valid ? "Antigravity 凭据写入失败" : "Antigravity 登录字段无效");
     }
   } else if (command == "login" && !requestId.isEmpty() &&
              requestId == settings.codexProvisionId) {
@@ -1813,6 +2287,7 @@ void handleSerialCommand(const String& line) {
     addWindow("seven_day", sevenDay);
     addWindow("chatgpt_five_hour", chatgptFive);
     addWindow("chatgpt_seven_day", chatgptSeven);
+    addWindow("antigravity_seven_day", antigravitySeven);
     auto addBalance = [&](const char* summaryName, const char* listName,
                           const BalanceGroup& group) {
       bool present = false;
@@ -1865,6 +2340,7 @@ void handleSerialCommand(const String& line) {
     };
     addSourceStatus("chatgpt_status", chatgptSource);
     addSourceStatus("claude_status", claudeSource);
+    addSourceStatus("antigravity_status", antigravitySource);
     addSourceStatus("deepseek_status", deepseekBalances.status);
     addSourceStatus("openrouter_status", openrouterBalances.status);
     cJSON_AddBoolToObject(response, "configured", settings.configured());
@@ -1879,6 +2355,27 @@ void handleSerialCommand(const String& line) {
                           settings.codexNeedsLogin || settings.codexPending);
     cJSON_AddBoolToObject(response, "chatgpt_pending", settings.codexPending);
     cJSON_AddBoolToObject(response, "codex_configured", settings.codexConfigured());
+    cJSON_AddBoolToObject(response, "antigravity_configured", antigravityAuth.configured());
+    cJSON_AddBoolToObject(response, "antigravity_needs_login",
+                          antigravityAuth.needsLogin || antigravityAuth.pending);
+    cJSON_AddBoolToObject(response, "antigravity_pending", antigravityAuth.pending);
+    if (!antigravityAuth.account.isEmpty()) {
+      cJSON_AddStringToObject(response, "antigravity_account",
+                              antigravityAuth.account.c_str());
+    }
+    if (!antigravityPlan.isEmpty()) {
+      cJSON_AddStringToObject(response, "antigravity_plan", antigravityPlan.c_str());
+    }
+    // 充值余额：present=false 表示这次（或至今没有一次）响应里没带 availableCredits。
+    // amount 已按 100 credits = 1 美元换算；minimum 低于它就不能再用于计费。
+    cJSON* credits = cJSON_AddObjectToObject(response, "antigravity_credits");
+    cJSON_AddBoolToObject(credits, "present", antigravityCredits.present);
+    if (antigravityCredits.present) {
+      cJSON_AddNumberToObject(credits, "amount", antigravityCredits.amount);
+      cJSON_AddNumberToObject(credits, "minimum", antigravityCredits.minimum);
+    }
+    const bool antigravityOverage = antigravity::overageMode(antigravitySeven, antigravityCredits);
+    cJSON_AddBoolToObject(response, "antigravity_overage", antigravityOverage);
     cJSON_AddBoolToObject(response, "deepseek_configured", settings.deepseekConfigured());
     cJSON_AddBoolToObject(response, "openrouter_configured", settings.openrouterConfigured());
     cJSON_AddBoolToObject(response, "wifi_connected", WiFi.status() == WL_CONNECTED);
@@ -1929,7 +2426,8 @@ void handleSerialCommand(const String& line) {
     cJSON_AddStringToObject(response, "error", "未知命令");
   }
   if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(response, "ok")) &&
-      (command == "configure" || command == "login" || command == "claude_login" || command == "erase")) {
+      (command == "configure" || command == "login" || command == "claude_login" ||
+       command == "antigravity_login" || command == "erase")) {
     char* reply = cJSON_PrintUnformatted(response);
     if (reply) {
       lastMutationId = requestId;
