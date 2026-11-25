@@ -157,7 +157,8 @@
 - CLI：`tsc --noEmit` 通过；`node --import tsx --test tests/*.test.ts` → **31/31 通过**
   （新增 `tests/google-oauth.test.ts` 5 个）。
 - 视觉：`firmware/scripts/render_rows_host.cpp` 用固件同一份 `window_render.h`
-  渲染 8 个 128×64 帧（.shots/rows/*.pbm→png），逐张读过：徽标为 9×11 白块 +
+  渲染 8 个 128×64 帧（当时放在 `.shots/`，任务结束后已清理；工具仍在
+  `firmware/scripts/render_rows_host.cpp`），逐张读过：徽标为 9×12 白块 +
   镂空字母，`[O] [3d] Δ-7h 40%`、`[G] [4d] 0% 12.34`、`[G] [--] … --` 排版正确，
   余额行不受影响。这是电脑端渲染，不是实物屏幕。
 - `git diff --check` 通过。
