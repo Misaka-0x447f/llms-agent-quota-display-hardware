@@ -1,6 +1,18 @@
 # 任务记录：Antigravity 额度读取 + plan 徽标
 
-## 当前阶段与下一步（2026-11-25 23:5x）
+## 交付完成（2026-11-26 00:1x）
+
+- 已提交并推送到 `origin/main`：
+  - `67d27a6` feat: read Antigravity weekly quota, plan badges and 4 rows
+  - `ac5f038` docs: record the Antigravity badge task and its prototype
+- 首次 `git push` 被 GitHub push protection 拒绝（提交内含 Antigravity 的
+  Google OAuth client id/secret，`GH013`）。已把两个值移出仓库、改为本地配置 +
+  构建时注入，重写提交后推送成功；推送前用正则确认提交内容里没有这两个值。
+- 设备当前运行该版本：4 行（`antigravity:7d@3m,chatgpt:7d@3m,deepseek@50s,openrouter@50s`，
+  用户自己调整的顺序）、徽标、Gemini 周额度、档位/余额都正常。
+- 仓库没有 CI，不涉及发布流程。
+
+## 原始阶段（2026-11-25 23:5x）
 
 - 真机验证完成：4 行、徽标、Antigravity 7d、档位/余额都读到；`overage=false`。
 - 代码审查 5 轮完成，第 4、5 轮无合并阻塞；审查后增量（4 行、UA、credits 解析、
